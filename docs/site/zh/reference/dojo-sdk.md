@@ -39,7 +39,9 @@ dojosdk = { path = "../DojoSDK" }
 | 字段 | 说明 |
 | --- | --- |
 | `dojosdk` (`DojoSDKConfig`) | API key、base_url、timeout、retries |
-| `dashboard.financial.sdk_cache_dir` | HF hub 缓存目录（默认 `~/.cache/huggingface/hub`） |
+| `dojosdk.offline.cache_dir` | 本地快照缓存目录（默认 `~/.cache/huggingface/hub`） |
+| `dojosdk.offline.backend` | `auto`、`huggingface` 或 `modelscope` |
+| `dojosdk.offline.startup_paths` | 启动时显式确保的快照端点 |
 
 ## 数据流
 

@@ -100,7 +100,6 @@ async def test_kline_get_or_fetch_and_load_all_share_memory_cache() -> None:
     assert response.bars[0].close == 100
     assert response.as_of == "2026-06-20"
     assert client.stocks.calls == [
-        ("get_all_klines_with_df", {}),
         ("get_kline", {"symbol": "AAPL", "limit": 20, "kline_t": "1D"}),
     ]
 
@@ -126,7 +125,6 @@ async def test_kline_batch_calls_single_symbol_sdk_contract() -> None:
 
     assert set(result.items) == {"AAPL", "MSFT"}
     assert client.stocks.calls == [
-        ("get_all_klines_with_df", {}),
         ("get_kline", {"symbol": "AAPL", "limit": 15}),
         ("get_kline", {"symbol": "MSFT", "limit": 15}),
     ]
@@ -134,23 +132,74 @@ async def test_kline_batch_calls_single_symbol_sdk_contract() -> None:
 
 @pytest.mark.asyncio
 async def test_kline_stats_reports_memory_state() -> None:
-    client = FakeDojo()
-    store = KlineStore(client, StockStore(client), StockSectorStore(client))
-    import pandas as pd
+    def kline_rows(*, symbol: str, **_kwargs):
+        return [
+            {
+                "symbol": symbol,
+                "bar_time": "2026-06-20",
+                "open": 99,
+                "high": 101,
+                "low": 98,
+                "close": 100,
+            }
+        ]
 
-    store._in_memory_updates = {
-        "AAPL": pd.DataFrame([{"symbol": "AAPL", "bar_time": "2026-06-20"}]),
-        "MSFT": pd.DataFrame(),
-    }
-    store._cache = {"AAPL_None_None_None_None_252": "dummy"}
+    client = FakeDojo(stocks={"get_kline": kline_rows})
+    store = KlineStore(client, StockStore(client), StockSectorStore(client))
     store.member_symbols = 2
+    await store.get_or_fetch_kline("AAPL", limit=20)
 
     stats = await store.stats()
 
     assert stats.member_symbols == 2
-    assert stats.tracked_symbols == 2
+    assert stats.tracked_symbols == 1
     assert stats.loaded_symbols == 1
     assert stats.initial_load_in_progress is False
+
+
+def test_kline_response_cache_is_invalidated_when_snapshot_token_changes() -> None:
+    client = FakeDojo()
+    store = KlineStore(client, StockStore(client), StockSectorStore(client))
+    response = kline_store_module.StockKlineResponse(
+        symbol="AAPL",
+        as_of="2026-06-20",
+        bars=[],
+    )
+    first_snapshot = {
+        "backend": "huggingface",
+        "repo_id": "AlphaDojo/dojo_stock_kline",
+        "snapshot_token": "token-1",
+        "resolved_revision": "revision-1",
+    }
+    store._observe_snapshot(first_snapshot)
+    key = store._response_cache_key(
+        "AAPL",
+        market=None,
+        kline_t="1D",
+        start_time=None,
+        end_time=None,
+        min_bar_time=None,
+        price_adj_type="pre",
+        limit=20,
+    )
+    store._cache_put(key, response)
+    assert len(store._cache) == 1
+
+    store._observe_snapshot(
+        {
+            "backend": "huggingface",
+            "repo_id": "AlphaDojo/dojo_stock_kline",
+            "snapshot_token": "token-2",
+            "resolved_revision": "revision-2",
+        }
+    )
+    assert not store._cache
+    assert store.snapshot_metadata == {
+        "backend": "huggingface",
+        "repo_id": "AlphaDojo/dojo_stock_kline",
+        "snapshot_token": "token-2",
+        "resolved_revision": "revision-2",
+    }
 
 
 @pytest.mark.asyncio
@@ -209,8 +258,13 @@ async def test_prioritize_sector_path_fetches_l3_then_l2_then_l1(monkeypatch) ->
         },
     )
 
-    async def record(symbols: list[str], limit: int = 252) -> ConstituentKlineBatchResponse:
+    async def record(
+        symbols: list[str],
+        limit: int = 252,
+        fields: tuple[str, ...] | None = None,
+    ) -> ConstituentKlineBatchResponse:
         del limit
+        assert fields == ("symbol", "bar_time", "open", "high", "low", "close", "vol")
         calls.append(symbols)
         return ConstituentKlineBatchResponse()
 

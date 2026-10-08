@@ -5,9 +5,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from dojo.client.async_client import AsyncDojo
-
+from dojoagents.config.loader import ConfigStore
 from dojoagents.config.models import FinancialDashboardConfig
+from dojoagents.dojo_sdk import close_async_dojo, create_async_dojo
 from dojoagents.dashboard.services.financial_registry import FinancialDomainRegistry
 from dojoagents.dashboard.jobs.precompute.sector_daily import PRECOMPUTE_DIR
 from dojoagents.dashboard.jobs.precompute.theme_state_daily import (
@@ -33,6 +33,7 @@ def configure_parser(subcommands: argparse._SubParsersAction) -> None:
         help="Enrich Dashboard sector snapshots with theme-state metrics",
     )
     parser.add_argument("--data-root", type=Path, default=None)
+    parser.add_argument("--config", default="~/.dojo/agents.yaml")
     parser.add_argument("--input-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--start-date", default=None)
@@ -90,7 +91,9 @@ async def run_precompute_sector_theme_state(args: argparse.Namespace) -> int:
     progress = _PrecomputeProgressReporter()
     on_progress: ProgressCallback = progress.callback
 
-    client = AsyncDojo()
+    agents_config = ConfigStore(getattr(args, "config", None) or "~/.dojo/agents.yaml").snapshot()
+    client = create_async_dojo(agents_config)
+    write_client = create_async_dojo(agents_config, online=True) if args.upload else None
     registry = FinancialDomainRegistry()
     # Phase B reads Phase A from disk. Do not preload the precomputed stores here:
     # their normal load path may sync the remote dataset over the local input.
@@ -115,7 +118,7 @@ async def run_precompute_sector_theme_state(args: argparse.Namespace) -> int:
             fin_store=None if args.skip_fundamentals else registry.stock_fin_indicators_store,
             start_date=args.start_date,
             end_date=args.end_date,
-            upload_client=client if args.upload else None,
+            upload_client=write_client if args.upload else None,
             skip_fundamentals=bool(args.skip_fundamentals),
             skip_volume_enrich=bool(args.skip_volume_enrich),
             on_progress=on_progress,
@@ -129,4 +132,7 @@ async def run_precompute_sector_theme_state(args: argparse.Namespace) -> int:
     if registry.theme_state_precomputed_store is not None:
         registry.theme_state_precomputed_store.reload(published_dir)
     LOGGER.info("%s", json.dumps(manifest, ensure_ascii=False, indent=2))
+    await close_async_dojo(client)
+    if write_client is not None:
+        await close_async_dojo(write_client)
     return 0

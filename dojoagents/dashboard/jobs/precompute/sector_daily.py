@@ -23,7 +23,7 @@ from dojoagents.dashboard.services.stock_quote_filter import (
     stock_passes_ticker_market_cap_min,
     ticker_cap_mins_snapshot,
 )
-from dojoagents.dashboard.services.kline_store import KlineStore
+from dojoagents.dashboard.services.kline_store import KLINE_ELIGIBILITY_FIELDS, KlineStore
 from dojoagents.dashboard.services.kline_segment import sector_member_daily_return_usable
 from dojoagents.dashboard.services.sector_return_coverage import sector_day_return_coverage_ok
 from dojoagents.dashboard.services.sector_store import ResolvedSectorPath, SectorStore
@@ -40,6 +40,10 @@ MANIFEST_FILE = "manifest.json"
 
 DATA_START_DATE = "2025-01-01"
 SCHEMA_VERSION = "3"
+# Keep each lazy SDK materialization comfortably below the default 100k-row
+# safety ceiling.  The precompute window includes roughly 40 calendar days, so
+# a 1,000-symbol batch remains bounded even when every symbol trades daily.
+KLINE_SYMBOL_BATCH_SIZE = 1000
 
 CONSTITUENT_COLUMNS = [
     "level1_id",
@@ -228,19 +232,36 @@ async def prepare_sector_precompute_input(
 
     recent_start = (date.fromisoformat(str(end_date or date.today().isoformat())[:10]) - timedelta(days=40)).isoformat()
     working_start = min(lookback_start, recent_start)
+    # Rows per batch ≈ batch_size × trading days in window. The offline
+    # materialization ceiling is 100k rows per call, so a full-history rebuild
+    # (~650 calendar days) must shrink the 1,000-symbol batch accordingly.
+    window_end_d = date.fromisoformat(str(end_date or date.today().isoformat())[:10])
+    window_days = max(1, (window_end_d - date.fromisoformat(working_start[:10])).days + 1)
+    batch_size = max(50, min(KLINE_SYMBOL_BATCH_SIZE, 80_000 // window_days))
     for source_market, symbols in symbols_by_market.items():
         get_batch = getattr(kline_store, "get_klines", None)
         if callable(get_batch):
-            batch = await get_batch(
-                symbols,
-                limit=0,
-                market=source_market,
-                start_time=working_start,
-                end_time=end_date,
-                price_adj_type="pre",
-                refresh=True,
-            )
-            response_by_ticker.update({(source_market, symbol): response for symbol, response in batch.items.items()})
+            for offset in range(0, len(symbols), batch_size):
+                symbol_batch = symbols[offset : offset + batch_size]
+                batch = await get_batch(
+                    symbol_batch,
+                    limit=0,
+                    market=source_market,
+                    start_time=working_start,
+                    end_time=end_date,
+                    price_adj_type="pre",
+                    refresh=True,
+                    fields=KLINE_ELIGIBILITY_FIELDS,
+                )
+                response_by_ticker.update(
+                    {
+                        (source_market, symbol): response
+                        for symbol, response in batch.items.items()
+                    }
+                )
+                kline_progress += len(symbol_batch)
+                if on_progress is not None:
+                    on_progress("kline", kline_progress, max(kline_total, 1))
         else:
             for symbol in symbols:
                 response = await kline_store.get_or_fetch_kline(
@@ -251,12 +272,13 @@ async def prepare_sector_precompute_input(
                     end_time=end_date,
                     price_adj_type="pre",
                     limit=0,
+                    fields=KLINE_ELIGIBILITY_FIELDS,
                 )
                 if response is not None:
                     response_by_ticker[(source_market, symbol)] = response
-        kline_progress += len(symbols)
-        if on_progress is not None:
-            on_progress("kline", kline_progress, max(kline_total, 1))
+                kline_progress += 1
+                if on_progress is not None:
+                    on_progress("kline", kline_progress, max(kline_total, 1))
 
     for path, assignment, stock in candidates:
         response = response_by_ticker.get((assignment.market, assignment.ticker))
@@ -577,11 +599,24 @@ def compute_and_stage_sector_precomputed(
     validate_precompute_market_coverage(snapshot.stats)
     constituents_df, ticker_daily_df, sector_daily_df, manifest = compute_sector_precomputed_frames(snapshot)
     existing_paths = [out_dir / filename for filename in (CONSTITUENTS_FILE, TICKER_DAILY_FILE, SECTOR_DAILY_FILE)]
-    if market and all(path.exists() for path in existing_paths):
+    # An incremental run (explicit market, or a start_date after the dataset
+    # inception) must extend the published history, never replace it. A
+    # full-window run (start_date == DATA_START_DATE, no market) is the only
+    # case that rebuilds history from scratch.
+    incremental = market is not None or snapshot.start_date > DATA_START_DATE
+    if incremental and all(path.exists() for path in existing_paths):
         existing_frames = [pd.read_parquet(path) for path in existing_paths]
-        constituents_df = pd.concat([existing_frames[0][existing_frames[0]["market"] != market], constituents_df], ignore_index=True)
-        ticker_history = existing_frames[1][(existing_frames[1]["market"] != market) | (existing_frames[1]["trade_date"].astype(str) < snapshot.start_date)]
-        sector_history = existing_frames[2][(existing_frames[2]["market"] != market) | (existing_frames[2]["trade_date"].astype(str) < snapshot.start_date)]
+        if market:
+            constituents_df = pd.concat([existing_frames[0][existing_frames[0]["market"] != market], constituents_df], ignore_index=True)
+            ticker_history = existing_frames[1][(existing_frames[1]["market"] != market) | (existing_frames[1]["trade_date"].astype(str) < snapshot.start_date)]
+            sector_history = existing_frames[2][(existing_frames[2]["market"] != market) | (existing_frames[2]["trade_date"].astype(str) < snapshot.start_date)]
+        else:
+            # Constituents are a current-state snapshot (no time dimension): a
+            # full-markets incremental run re-derives every market, so the new
+            # frame fully replaces the old one. Only the time-series frames
+            # keep their pre-window history.
+            ticker_history = existing_frames[1][existing_frames[1]["trade_date"].astype(str) < snapshot.start_date]
+            sector_history = existing_frames[2][existing_frames[2]["trade_date"].astype(str) < snapshot.start_date]
         ticker_daily_df = pd.concat([ticker_history, ticker_daily_df], ignore_index=True)
         sector_daily_df = pd.concat([sector_history, sector_daily_df], ignore_index=True)
         manifest.update(
@@ -603,6 +638,22 @@ def compute_and_stage_sector_precomputed(
     constituents_df.to_parquet(constituents_path, index=False)
     ticker_daily_df.to_parquet(ticker_daily_path, index=False)
     sector_daily_df.to_parquet(sector_daily_path, index=False)
+
+    # Phase A and the theme-state enrichment share one published directory.
+    # A market-only Phase A refresh must not erase the enrichment tables (or
+    # repository documentation) that it does not rebuild.  Copy only existing
+    # top-level supplemental files; generated core files and the manifest are
+    # always replaced by the newly validated snapshot above.
+    core_names = {
+        CONSTITUENTS_FILE,
+        TICKER_DAILY_FILE,
+        SECTOR_DAILY_FILE,
+        MANIFEST_FILE,
+    }
+    if out_dir.exists():
+        for source_path in out_dir.iterdir():
+            if source_path.is_file() and source_path.name not in core_names:
+                shutil.copy2(source_path, staging_dir / source_path.name)
 
     manifest["files"] = {
         CONSTITUENTS_FILE: {"rows": len(constituents_df), "sha256": _file_sha256(constituents_path)},

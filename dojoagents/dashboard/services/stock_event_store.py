@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import time
 from typing import Dict, Optional
 
 from dojoagents.dashboard.schemas.stock_event import CoreTickerEventsResponse
@@ -15,6 +16,7 @@ class StockEventStore:
     def __init__(self, source):
         self.gateway = source if callable(getattr(source, "stock_events", None)) else DojoDataGateway(source)
         self.cache: Dict[str, CoreTickerEventsResponse] = {}
+        self._cache_expires_at: Dict[str, float] = {}
         self._inflight: Dict[str, asyncio.Task[CoreTickerEventsResponse]] = {}
         self._refresh_keys = set()
 
@@ -37,8 +39,10 @@ class StockEventStore:
         cache_key = f"{market_code}:{symbol}:{page_size}"
 
         cached = self.cache.get(cache_key)
-        if cached is not None:
+        if cached is not None and time.monotonic() < self._cache_expires_at.get(cache_key, 0.0):
             return cached
+        self.cache.pop(cache_key, None)
+        self._cache_expires_at.pop(cache_key, None)
         task = self._inflight.get(cache_key)
         if task is None:
             task = asyncio.create_task(self._fetch(symbol, market_code, page_size))
@@ -46,6 +50,7 @@ class StockEventStore:
         try:
             result = await task
             self.cache[cache_key] = result
+            self._cache_expires_at[cache_key] = time.monotonic() + 120.0
             return result
         finally:
             if self._inflight.get(cache_key) is task:

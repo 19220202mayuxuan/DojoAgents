@@ -6,6 +6,7 @@ import logging
 import threading
 from typing import Any, List, Optional
 from mcp import ClientSession, StdioServerParameters
+from mcp.client import sse as mcp_sse
 from mcp.client.stdio import stdio_client
 from dojoagents.tools.registry import ToolRegistry, ToolSpec
 
@@ -239,8 +240,6 @@ class MCPServerTask:
             sampling_handler = SamplingHandler(self.name, self.config)
 
             if url or self.config.get("transport") == "sse":
-                from mcp.client.sse import sse_client
-
                 headers = self.config.get("headers", {})
 
                 oauth_auth = None
@@ -257,7 +256,7 @@ class MCPServerTask:
                 if oauth_auth is not None:
                     sse_kwargs["auth"] = oauth_auth
 
-                transport_callable = lambda: sse_client(**sse_kwargs)  # noqa
+                transport_callable = lambda: mcp_sse.sse_client(**sse_kwargs)  # noqa
             else:
                 command = self.config.get("command")
                 args = self.config.get("args", [])
@@ -298,7 +297,7 @@ class MCPServerTask:
             if oauth_auth is not None:
                 sse_kwargs["auth"] = oauth_auth
 
-            self.client_ctx = sse_client(**sse_kwargs)
+            self.client_ctx = mcp_sse.sse_client(**sse_kwargs)
             read_stream, write_stream = await self.client_ctx.__aenter__()
 
             self.session = ClientSession(

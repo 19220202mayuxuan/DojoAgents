@@ -354,7 +354,7 @@ def test_background_run_preprocesses_pipeline_command():
     active_task = captured.get("active_task")
     pipeline = captured.get("pipeline")
     assert isinstance(active_task, dict)
-    assert active_task["task_id"] == "sector-attribution"
+    assert active_task["task_id"] == "event-trigger"
     assert active_task["params"]["trading_date"] == "2026-07-03"
     assert isinstance(pipeline, dict)
     assert pipeline["id"] == "daily-market-events"

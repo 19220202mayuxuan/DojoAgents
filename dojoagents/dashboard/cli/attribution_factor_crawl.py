@@ -22,8 +22,9 @@ from pydantic import ValidationError
 from dojo import AsyncDojo
 from dojoagents.attribution.base import AttributionFactor
 from dojoagents.config.loader import ConfigStore
+from dojoagents.dojo_sdk import close_async_dojo, create_async_dojo
 from dojoagents.dashboard.client.tasks import check_dashboard_health, dashboard_base_url_from_config
-from dojoagents.harnesses.built_in.financial.pipelines.trading_calendar import open_markets_on
+from dojoagents.utils.trading_calendar import open_markets_on
 from dojoagents.logging import LOGGER, configure_logging
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -530,24 +531,11 @@ def _partition_jobs(
 
 
 async def _close_client(client: Any) -> None:
-    close = getattr(client, "aclose", None)
-    if callable(close):
-        await close()
-        return
-    close = getattr(getattr(client, "_client", None), "aclose", None)
-    if callable(close):
-        await close()
+    await close_async_dojo(client)
 
 
-def _sdk_client(config: Any) -> AsyncDojo:
-    sdk = config.dojosdk
-    kwargs = {
-        "api_key": sdk.api_key if sdk else None,
-        "base_url": sdk.base_url if sdk else None,
-        "timeout": sdk.timeout if sdk else 60.0,
-        "max_retries": sdk.max_retries if sdk else 1,
-    }
-    return AsyncDojo(**{key: value for key, value in kwargs.items() if value is not None})
+def _sdk_client(config: Any, *, online: bool | None = None) -> AsyncDojo:
+    return create_async_dojo(config, online=online)
 
 
 async def _write_attribution_factors(client: AsyncDojo, items: list[dict[str, Any]], *, generation_time: str) -> int:
@@ -663,7 +651,7 @@ async def run_attribution_factor_crawl(args: argparse.Namespace) -> int:
         )
         return 0
 
-    client = _sdk_client(config)
+    client = _sdk_client(config, online=True)
     try:
         written = await _write_attribution_factors(client, items, generation_time=generation_time)
         LOGGER.info(

@@ -97,6 +97,11 @@ class GlobalStores:
         )
         cls.dojo_sphere_service = DojoSphereService(
             SectorMetricsStore(data_root, schema_version=1),
+            revision_provider=lambda: (
+                cls.sector_precomputed_store.data_revision()
+                if cls.sector_precomputed_store is not None
+                else None
+            ),
         )
         cls.sector_precomputed_store = SectorPrecomputedStore(data_root)
         cls.kline_store.sector_precomputed_store = cls.sector_precomputed_store

@@ -37,7 +37,9 @@ dojosdk = { path = "../DojoSDK" }
 | Field | Purpose |
 | --- | --- |
 | `dojosdk` (`DojoSDKConfig`) | API key, base_url, timeout, retries |
-| `dashboard.financial.sdk_cache_dir` | HF hub cache (default `~/.cache/huggingface/hub`) |
+| `dojosdk.offline.cache_dir` | Local snapshot cache (default `~/.cache/huggingface/hub`) |
+| `dojosdk.offline.backend` | `auto`, `huggingface`, or `modelscope` |
+| `dojosdk.offline.startup_paths` | Explicit snapshot endpoints ensured at startup |
 
 ## Data flow
 

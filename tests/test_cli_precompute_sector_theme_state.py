@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -70,12 +71,19 @@ async def test_theme_state_command_reads_local_phase_a_without_precomputed_store
             return None
 
     client = object()
+    writer = object()
 
     async def build(**kwargs: object) -> dict[str, object]:
         calls["build"] = kwargs
         return {"published_dir": str(output_dir)}
 
-    monkeypatch.setattr(command, "AsyncDojo", lambda: client)
+    monkeypatch.setattr(
+        command,
+        "create_async_dojo",
+        lambda _config, *, online=None: writer if online else client,
+    )
+    monkeypatch.setattr(command, "close_async_dojo", AsyncMock())
+    monkeypatch.setattr(command, "ConfigStore", lambda _path: SimpleNamespace(snapshot=lambda: object()))
     monkeypatch.setattr(command, "FinancialDomainRegistry", Registry)
     monkeypatch.setattr(command, "_PrecomputeProgressReporter", Progress)
     monkeypatch.setattr(command, "build_theme_state_precomputed", build)
@@ -109,7 +117,7 @@ async def test_theme_state_command_reads_local_phase_a_without_precomputed_store
     assert isinstance(build_args, dict)
     assert build_args["source_dir"] == input_dir
     assert build_args["out_dir"] == output_dir
-    assert build_args["upload_client"] is client
+    assert build_args["upload_client"] is writer
     registry = calls["registry"]
     assert isinstance(registry, Registry)
     assert registry.sector_precomputed_store.paths == [output_dir]

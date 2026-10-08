@@ -53,6 +53,7 @@ from dojoagents.dashboard.schemas.portfolio import (
     UpdatePortfolioRequest,
 )
 from dojoagents.dashboard.services.dojo_core_pe import resolve_core_ticker_pe_band
+from dojoagents.dashboard.services.kline_store import KLINE_OHLCV_FIELDS
 from dojoagents.dashboard.services.dojo_core_quote import resolve_core_ticker_quote
 from dojoagents.dashboard.services.dojo_core_search import search_core_tickers
 from dojoagents.dashboard.services.dojo_core_sector import resolve_core_ticker_sector
@@ -903,6 +904,7 @@ async def search_company_ticker(
         q,
         market=internal_market,
         limit=limit,
+        fields=KLINE_OHLCV_FIELDS,
         require_market_cap_eligible=False,
     )
     mapped = [_model_dict(item) | {"market": _normalize_native_market(item.market) or item.market} for item in items]
@@ -1257,7 +1259,11 @@ async def build_market_overview(
         window_mode=window.mode,
         window_start=window.resolved_start or window_start,
         window_end=window.resolved_end or benchmarks.as_of or window_end,
-        as_of=window.as_of or benchmarks.as_of or window.resolved_end or window_end,
+        # The precomputed market window may be newer than the benchmark
+        # companion snapshot.  Report the actual analysis right edge first so
+        # agents do not incorrectly label all market data stale merely because
+        # one benchmark series trails it.
+        as_of=window.as_of or window.resolved_end or benchmarks.as_of or window_end,
         markets=markets,
         benchmarks=benchmark_map,
     )
@@ -1834,6 +1840,10 @@ async def build_sector_constituents_v1(
 
 async def build_ticker_quote_v1(registry, *, ticker: str, market: Optional[str]) -> Optional[TickerQuoteResponseV1]:
     internal_market = normalize_market_code(market)
+    if internal_market is not None:
+        refresh_symbols = getattr(registry.stock_store, "refresh_symbols", None)
+        if callable(refresh_symbols):
+            await refresh_symbols(internal_market, [ticker])
     quote = resolve_core_ticker_quote(ticker, market=internal_market, stock_store=registry.stock_store)
     if quote is None:
         return None
@@ -2159,6 +2169,7 @@ async def _fetch_kline_for_price_trends(
         market=market,
         kline_t=kline_t,
         min_bar_time=DATA_START_DATE,
+        fields=KLINE_OHLCV_FIELDS,
     )
     if wide is None:
         return None

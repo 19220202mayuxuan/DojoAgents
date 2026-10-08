@@ -25,7 +25,7 @@ dependencies = [
     "pyinstrument",
     "strands-agents",
     "strands-agents-tools",
-    "dojosdk>=0.1.23",
+    "dojosdk>=0.1.29",
     "exchange-calendars>=4,<5",
     "portalocker",
     "ddgs",
@@ -69,3 +69,15 @@ docs = [
     "mkdocs-material>=9,<10",
     "mkdocs-static-i18n>=1,<2",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "unit: deterministic tests with no external service dependency",
+    "offline_integration: local DojoSDK snapshot and dashboard integration tests",
+    "online_integration: tests that require live provider or API access",
+    "contract: API, configuration, and cross-repository contract tests",
+    "slow: long-running dataset, dashboard, or end-to-end tests",
+]
+
+[tool.uv.sources]
+dojosdk = { path = "../DojoSDK", editable = true }

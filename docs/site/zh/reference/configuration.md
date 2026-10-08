@@ -91,6 +91,14 @@ skills:
   disabled: []
   read_claude_skills: false
 
+dojosdk:
+  offline:
+    cache_dir: ~/.cache/huggingface/hub
+    backend: auto
+    startup_paths:
+      - /api/qdata/v1/stock/kline
+      - /api/qdata/v1/sector/info
+
 dashboard:
   host: 127.0.0.1
   port: 8765
@@ -98,7 +106,6 @@ dashboard:
     enabled: false
   financial:
     dashboard_data_root: ~/.dojo/dashboard-data
-    sdk_cache_dir: ~/.cache/huggingface/hub
     stock_quote_refresh_seconds: 15
     constituent_kline_max_concurrent: 8
 

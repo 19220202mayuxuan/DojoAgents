@@ -83,16 +83,32 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._single_remove_calls: set[ToolCallSignature] = set()
         self._halt_decision: ToolGuardrailDecision | None = None
 
     def reset_for_turn(self) -> None:
         self._exact_failure_counts.clear()
         self._same_tool_failure_counts.clear()
         self._no_progress.clear()
+        self._single_remove_calls.clear()
         self._halt_decision = None
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, args)
+
+        if tool_name == "portfolio_write_remove_candidates":
+            self._single_remove_calls.clear()
+        elif tool_name == "portfolio_write_remove_holding":
+            if signature in self._single_remove_calls:
+                return ToolGuardrailDecision(
+                    action="block",
+                    code="remove_holding_use_batch",
+                    message="Use portfolio_write_remove_candidates for repeated holding removals.",
+                    tool_name=tool_name,
+                    count=2,
+                    signature=signature,
+                )
+            self._single_remove_calls.add(signature)
 
         if tool_name == "terminal":
             command = str((args or {}).get("command") or "").lower()

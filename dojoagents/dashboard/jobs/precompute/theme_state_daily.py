@@ -15,6 +15,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from dojoagents.dashboard.services.kline_store import KLINE_VOLUME_FIELDS
+
 from dojoagents.dashboard.services.benchmark_store import DEFAULT_BENCHMARKS
 from dojoagents.dashboard.services.market_sector_lead import concept_code_for, link_key_from_concept_code, slugify
 from dojoagents.dashboard.jobs.precompute.sector_daily import (
@@ -843,6 +845,7 @@ async def _enrich_ticker_volumes_from_kline(
                 market=str(market),
                 kline_t="1D",
                 limit=0,
+                fields=KLINE_VOLUME_FIELDS,
             )
         except Exception as exc:  # noqa: BLE001 — boundary: skip ticker
             LOGGER.warning("theme-state volume enrich failed for %s:%s: %s", market, ticker, exc)

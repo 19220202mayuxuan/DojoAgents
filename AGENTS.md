@@ -126,8 +126,8 @@ Future agents MUST reuse these storage and error primitives. Do NOT write direct
 
 ### K-line Data Ownership (MANDATORY)
 
-- DojoSDK is the single owner of offline K-line files, the in-memory Pandas DataFrame cache, and its symbol/time index.
-- `dojoagents/dashboard/services/dojo_data_gateway.py` MUST read K-line data through DojoSDK and may provide only a thin query adapter over the SDK-owned DataFrame/index.
+- DojoSDK is the single owner of offline K-line files, snapshot revisions, lazy filtering, limits, and price adjustment.
+- `dojoagents/dashboard/services/dojo_data_gateway.py` MUST read K-line data through DojoSDK's bounded `get_klines()` API and retain the returned snapshot metadata. It MUST NOT build a full-market DataFrame or symbol/time index.
 - `dojoagents/dashboard/services/kline_store.py` MAY keep a bounded cache of assembled API responses, but MUST NOT preload, copy, persist, or rebuild the complete K-line dataset.
 - Do NOT add a DojoAgents-owned K-line parquet/JSONL working set, `raw_by_symbol` full-data mirror, or startup full-data preload. These duplicate DojoSDK state and significantly increase startup I/O, memory, and serialization time.
 - Cross-process persistence and dataset refresh belong in DojoSDK. If its query surface is insufficient, extend DojoSDK instead of introducing another K-line storage layer in DojoAgents.
