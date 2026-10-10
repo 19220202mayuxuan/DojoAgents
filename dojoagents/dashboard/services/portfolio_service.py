@@ -17,7 +17,11 @@ from dojoagents.dashboard.services.portfolio_order_execution import (
     sanitize_invalid_filled_orders,
 )
 from dojoagents.dashboard.services.portfolio_store import MARKETS, PortfolioStore
-from dojoagents.dashboard.services.kline_store import KlineStore
+from dojoagents.dashboard.services.kline_store import (
+    KLINE_CLOSE_FIELDS,
+    KLINE_OPEN_FIELDS,
+    KlineStore,
+)
 from dojoagents.dashboard.services.kline_bar_utils import (
     DATA_START_DATE,
     KLINE_MAX_LIMIT,
@@ -258,7 +262,9 @@ async def _ensure_order_ticker_closes(
         for ticker in tickers:
             if market_closes.get(ticker):
                 continue
-            kline = await kline_store.get_or_fetch_kline(ticker, limit=kline_limit)
+            kline = await kline_store.get_or_fetch_kline(
+                ticker, limit=kline_limit, fields=KLINE_CLOSE_FIELDS
+            )
             if kline is None or not kline.bars:
                 continue
             closes = _closes_from_kline_bars(kline.bars, chart_start=chart_start)
@@ -454,6 +460,7 @@ class PortfolioService:
                 start_time=open_date,
                 end_time=open_date,
                 limit=1,
+                fields=KLINE_OPEN_FIELDS,
             )
             if kline is None or not kline.bars:
                 raise PortfolioValidationError(
@@ -938,7 +945,9 @@ class PortfolioService:
         if not all_tickers:
             return ticker_closes_by_market
 
-        batch = await self.kline_store.get_klines(all_tickers, limit=kline_limit)
+        batch = await self.kline_store.get_klines(
+            all_tickers, limit=kline_limit, fields=KLINE_CLOSE_FIELDS
+        )
         return _ticker_closes_by_market_from_batch(orders, batch, chart_start=chart_start)
 
     async def _build_performance(
@@ -974,9 +983,13 @@ class PortfolioService:
         candidate_rows = [row for row in raw.get("candidates") or [] if isinstance(row, dict)]
         performance_tickers = _collect_performance_tickers(orders, candidate_rows)
         order_tickers = sorted({ticker for market_tickers in _order_tickers_by_market(orders).values() for ticker in market_tickers})
-        order_kline_batch = await self.kline_store.get_klines(order_tickers, limit=kline_limit) if order_tickers else ConstituentKlineBatchResponse(items={})
+        order_kline_batch = await self.kline_store.get_klines(
+            order_tickers, limit=kline_limit, fields=KLINE_CLOSE_FIELDS
+        ) if order_tickers else ConstituentKlineBatchResponse(items={})
         if performance_tickers and set(performance_tickers) - set(order_tickers):
-            kline_batch = await self.kline_store.get_klines(performance_tickers, limit=kline_limit)
+            kline_batch = await self.kline_store.get_klines(
+                performance_tickers, limit=kline_limit, fields=KLINE_CLOSE_FIELDS
+            )
         else:
             kline_batch = order_kline_batch
 

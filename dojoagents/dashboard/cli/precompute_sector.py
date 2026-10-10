@@ -12,6 +12,7 @@ from dojo.client.async_client import AsyncDojo
 
 from dojoagents.config.loader import ConfigStore
 from dojoagents.config.models import FinancialDashboardConfig
+from dojoagents.dojo_sdk import close_async_dojo, create_async_dojo
 from dojoagents.dashboard.services.financial_registry import FinancialDomainRegistry
 from dojoagents.dashboard.jobs.precompute.sector_daily import (
     ProgressCallback,
@@ -188,7 +189,8 @@ async def run_precompute_sector(args: argparse.Namespace) -> int:
     data_root_str = args.data_root or FinancialDashboardConfig.dashboard_data_root
     data_root = Path(data_root_str).expanduser().resolve()
     floors = apply_configured_ticker_market_cap_mins(getattr(args, "config", None))
-    financial = ConfigStore(getattr(args, "config", None) or "~/.dojo/agents.yaml").snapshot().dashboard.financial
+    agents_config = ConfigStore(getattr(args, "config", None) or "~/.dojo/agents.yaml").snapshot()
+    financial = agents_config.dashboard.financial
     kline_concurrency = args.kline_concurrency if args.kline_concurrency is not None else financial.constituent_kline_max_concurrent
     if kline_concurrency < 1:
         raise ValueError("--kline-concurrency must be at least 1")
@@ -203,7 +205,8 @@ async def run_precompute_sector(args: argparse.Namespace) -> int:
     progress = _PrecomputeProgressReporter()
     on_progress: ProgressCallback = progress.callback
 
-    client = AsyncDojo()
+    client = create_async_dojo(agents_config)
+    write_client = create_async_dojo(agents_config, online=True) if args.upload or args.upload_api else None
     registry = FinancialDomainRegistry()
     await registry.init_and_load_all(client, data_root=data_root, preload=True, kline_max_concurrent=kline_concurrency)
 
@@ -216,7 +219,7 @@ async def run_precompute_sector(args: argparse.Namespace) -> int:
             kline_store=registry.kline_store,
             start_date=args.start_date,
             market=_source_market(args.market) if args.market else None,
-            upload_client=client if args.upload else None,
+            upload_client=write_client if args.upload else None,
             on_progress=on_progress,
         )
     finally:
@@ -227,7 +230,7 @@ async def run_precompute_sector(args: argparse.Namespace) -> int:
 
     if args.upload_api:
         counts = await upload_market_precomputed(
-            client,
+            write_client,
             Path(manifest["published_dir"]),
             args.market,
             trade_date=args.trade_date or args.start_date,
@@ -248,7 +251,7 @@ async def run_precompute_sector(args: argparse.Namespace) -> int:
                 benchmark_store=registry.benchmark_store,
                 fin_store=(None if getattr(args, "skip_fundamentals", False) else registry.stock_fin_indicators_store),
                 start_date=args.start_date,
-                upload_client=client if args.upload else None,
+                upload_client=write_client if args.upload else None,
                 skip_fundamentals=bool(getattr(args, "skip_fundamentals", False)),
                 skip_volume_enrich=bool(getattr(args, "skip_volume_enrich", False)),
                 on_progress=theme_progress.callback,
@@ -262,4 +265,7 @@ async def run_precompute_sector(args: argparse.Namespace) -> int:
         manifest = theme_manifest
 
     LOGGER.info("%s", json.dumps(manifest, ensure_ascii=False, indent=2))
+    await close_async_dojo(client)
+    if write_client is not None:
+        await close_async_dojo(write_client)
     return 0

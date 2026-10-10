@@ -29,7 +29,7 @@ from dojoagents.dashboard.services.attribution_factor_service import (
     _unwrap_payload,
     canonical_attribution_sector_ref,
 )
-from dojoagents.harnesses.built_in.financial.pipelines.trading_calendar import open_markets_on
+from dojoagents.utils.trading_calendar import open_markets_on
 from dojoagents.logging import LOGGER, configure_logging
 from dojoagents.tasks.schema_validator import validate_json_payload
 
@@ -108,7 +108,7 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         help="Seconds to wait for an automatically started Dashboard",
     )
     parser.add_argument("--local", action="store_true", help="Run each Task in its local runtime")
-    parser.add_argument("--preload", action="store_true", help="Preload offline attribution-factor data")
+    parser.add_argument("--preload", action="store_true", help="Ensure the offline attribution-factor snapshot before querying")
     parser.add_argument("--dry-run", action="store_true", help="Discover sectors and print commands only")
     parser.add_argument(
         "--force-rerun",
@@ -189,16 +189,11 @@ def _sectors_in_window(rows: Iterable[Any], *, start_date: str, end_date: str) -
     return sorted(sectors)
 
 
-async def _ensure_af_preloaded(client: AsyncDojo, *, preload: bool) -> None:
-    if not preload:
+async def _ensure_af_snapshot(client: AsyncDojo, *, enabled: bool) -> None:
+    if not enabled:
         return
-    fn = getattr(client, "preload_offline_data", None)
-    if not callable(fn):
-        return
-    LOGGER.info("Preloading offline attribution-factor data")
-    result = fn(paths=[_AF_OFFLINE_PATH])
-    if asyncio.iscoroutine(result):
-        await result
+    LOGGER.info("Ensuring offline attribution-factor snapshot")
+    await client.ensure_offline_snapshots(paths=[_AF_OFFLINE_PATH])
 
 
 async def discover_brief_jobs(
@@ -460,7 +455,7 @@ async def run_sector_brief_extract(args: argparse.Namespace) -> int:
     else:
         discovery_client = _sdk_client(config)
         try:
-            await _ensure_af_preloaded(discovery_client, preload=bool(args.preload))
+            await _ensure_af_snapshot(discovery_client, enabled=bool(args.preload))
             jobs = await discover_brief_jobs(
                 discovery_client,
                 as_of_date=as_of_date,
@@ -548,7 +543,7 @@ async def run_sector_brief_extract(args: argparse.Namespace) -> int:
         LOGGER.info("Validated %d sector briefs without API write", len(items))
         return 0
 
-    client = _sdk_client(config)
+    client = _sdk_client(config, online=True)
     try:
         written = await _write_sector_briefs(client, items, generation_time=generation_time)
         LOGGER.info("Successfully wrote %d sector briefs through DojoSDK", written)

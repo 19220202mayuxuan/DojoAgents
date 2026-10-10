@@ -427,6 +427,18 @@ class GatewayRunner:
                 await adapter.send(event.target, "Usage:\n/plugins list - List all plugins\n/plugins delete <name> - Delete a plugin", thread_id=event.thread_id)
                 return {"accepted": True, "command": "plugins-help"}
 
+        skill_manager = getattr(getattr(self.runtime, "agent", None), "skill_manager", None)
+        if skill_manager is not None:
+            skill_instructions = skill_manager.load_skill(name, platform=event.platform)
+            if skill_instructions is not None:
+                user_request = arg.strip()
+                object.__setattr__(event, "text", (
+                    f'[IMPORTANT: The user has invoked the "{name}" skill. '
+                    "Follow these instructions for this request.]\n\n"
+                    f"{skill_instructions}\n\n"
+                    f"User request: {user_request}"
+                ))
+
         return None
 
     def _hook_config(self, platform: str) -> dict[str, Any] | None:

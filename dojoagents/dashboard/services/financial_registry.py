@@ -40,8 +40,20 @@ PRELOAD_PHASES: tuple[tuple[str, ...], ...] = (
         "sector_precomputed_store",
         "theme_state_precomputed_store",
     ),
-    ("kline_store",),
 )
+
+STARTUP_PRELOAD_STORE_ALLOWLIST = frozenset(
+    {
+        "sector_store",
+        "benchmark_store",
+        "portfolio_store",
+        "portfolio_service",
+    }
+)
+
+
+def _repo_slug(repo_id: str) -> str:
+    return str(repo_id).strip().rsplit("/", 1)[-1].lower()
 
 
 class FinancialDomainRegistry:
@@ -49,6 +61,7 @@ class FinancialDomainRegistry:
 
     def __init__(self) -> None:
         self.client: Optional[AsyncDojo] = None
+        self.live_client: Optional[AsyncDojo] = None
         self.gateway: Optional[DojoDataGateway] = None
         self.data_root: Optional[Path] = None
         self.sector_store: Optional[SectorStore] = None
@@ -68,18 +81,26 @@ class FinancialDomainRegistry:
         self.theme_state_precomputed_store: Optional[ThemeStatePrecomputedStore] = None
         self.sector_movers_service: Optional[SectorMoversService] = None
         self.refresh_store = None
+        self._loaded_store_names: set[str] = set()
+        self._lazy_load_locks: dict[str, asyncio.Lock] = {}
 
     async def init_and_load_all(
         self,
         client: AsyncDojo,
         *,
+        live_client: AsyncDojo | None = None,
         data_root: Path,
         preload: bool = True,
         portfolio_data_root: Path | None = None,
         kline_max_concurrent: int = 50,
     ) -> None:
         self.client = client
-        self.gateway = DojoDataGateway(client, kline_max_concurrent=kline_max_concurrent)
+        self.live_client = live_client
+        self.gateway = DojoDataGateway(
+            client,
+            live_client=live_client,
+            kline_max_concurrent=kline_max_concurrent,
+        )
         self.data_root = data_root.expanduser().resolve()
         self.sector_store = SectorStore(self.gateway)
         self.stock_store = StockStore(self.gateway)
@@ -113,8 +134,16 @@ class FinancialDomainRegistry:
         )
         self.dojo_sphere_service = DojoSphereService(
             SectorMetricsStore(data_root, schema_version=1),
+            revision_provider=lambda: (
+                self.sector_precomputed_store.data_revision()
+                if self.sector_precomputed_store is not None
+                else None
+            ),
         )
-        self.sector_precomputed_store = SectorPrecomputedStore(self.data_root)
+        self.sector_precomputed_store = SectorPrecomputedStore(
+            self.data_root,
+            snapshot_client=client,
+        )
         self.theme_state_precomputed_store = ThemeStatePrecomputedStore(self.data_root)
         self.kline_store.sector_precomputed_store = self.sector_precomputed_store
         self.sector_movers_service = SectorMoversService(
@@ -145,6 +174,7 @@ class FinancialDomainRegistry:
                 LOGGER.debug(f"开始加载 Store: {name} ...")
                 try:
                     await inst.load()
+                    self._loaded_store_names.add(name)
                     LOGGER.debug(f"Store {name} 加载完成。")
                 except Exception as e:
                     LOGGER.error(f"Store {name} 加载失败: {e}")
@@ -179,54 +209,126 @@ class FinancialDomainRegistry:
         LOGGER.debug("Registry preload complete.")
         return errors
 
-    async def refresh_after_offline_data_update(self) -> None:
-        """Drop in-memory market caches so the next request reads refreshed disk/SDK data."""
-        LOGGER.info("Refreshing in-memory market caches after offline data update")
-        if self.kline_store is not None:
-            self.kline_store._cache.clear()
-            self.kline_store.initial_load_complete = False
-        if self.gateway is not None and hasattr(self.gateway, "invalidate_kline_index"):
-            self.gateway.invalidate_kline_index()
-        if self.benchmark_store is not None:
-            self.benchmark_store._response_cache.clear()
-            self.benchmark_store._kline_cache.clear()
-        for store_name in (
-            "stock_fin_indicators_store",
-            "stock_event_store",
-            "stock_income_store",
-            "stock_news_store",
-        ):
+    async def ensure_stores_loaded(self, *store_names: str) -> None:
+        """Load feature stores once, on first use, without blocking startup.
+
+        A per-store lock prevents concurrent Dashboard requests from loading the
+        same Parquet-backed store more than once.
+        """
+        for name in dict.fromkeys(str(item).strip() for item in store_names if str(item).strip()):
+            if name in self._loaded_store_names:
+                continue
+            store = getattr(self, name, None)
+            if store is None or not callable(getattr(store, "load", None)):
+                raise RuntimeError(f"{name} is not initialized or loadable")
+            lock = self._lazy_load_locks.setdefault(name, asyncio.Lock())
+            async with lock:
+                if name in self._loaded_store_names:
+                    continue
+                await store.load()
+                self._loaded_store_names.add(name)
+
+    async def preload_startup(self, store_names: tuple[str, ...] | list[str]) -> list[Exception]:
+        """Preload only explicitly approved small stores during Dashboard startup."""
+        selected = list(dict.fromkeys(str(name).strip() for name in store_names if str(name).strip()))
+        unsupported = [name for name in selected if name not in STARTUP_PRELOAD_STORE_ALLOWLIST]
+        if unsupported:
+            raise ValueError(
+                "Dashboard startup preload contains non-whitelisted stores: "
+                + ", ".join(unsupported)
+            )
+        return await self.preload(selected)
+
+    async def refresh_after_offline_data_update(
+        self,
+        *,
+        updated_repos: tuple[str, ...] | list[str],
+    ) -> None:
+        """Invalidate only response/derived caches that depend on committed repos."""
+        repo_ids = tuple(dict.fromkeys(str(repo) for repo in updated_repos if str(repo).strip()))
+        if not repo_ids:
+            return
+        slugs = {_repo_slug(repo) for repo in repo_ids}
+        LOGGER.info("Refreshing caches for committed snapshot repositories: %s", repo_ids)
+
+        if "dojo_stock_kline" in slugs:
+            if self.kline_store is not None:
+                self.kline_store.invalidate_repos(repo_ids)
+            if self.gateway is not None and hasattr(self.gateway, "invalidate_kline_snapshot"):
+                self.gateway.invalidate_kline_snapshot()
+
+        reload_stores: list[str] = []
+        if slugs & {"dojo_stock_info", "dojo_quote"}:
+            reload_stores.append("stock_store")
+        if "dojo_benchmark_kline" in slugs:
+            reload_stores.append("benchmark_store")
+        if "dojo_sector_info" in slugs:
+            reload_stores.append("sector_store")
+        if "dojo_sector_symbol_relations" in slugs:
+            reload_stores.append("stock_sector_store")
+
+        cache_store_by_repo = {
+            "dojo_fin_indicators": "stock_fin_indicators_store",
+            "dojo_event_remind": "stock_event_store",
+            "dojo_main_income": "stock_income_store",
+            "dojo_stock_news": "stock_news_store",
+        }
+        for repo_slug, store_name in cache_store_by_repo.items():
+            if repo_slug not in slugs:
+                continue
             store = getattr(self, store_name, None)
             cache = getattr(store, "cache", None)
             if isinstance(cache, dict):
                 cache.clear()
-        if self.sector_movers_service is not None:
-            self.sector_movers_service.invalidate()
-        try:
-            from dojoagents.dashboard.services.market_dynamics_service import (
-                clear_market_dynamics_cache,
-            )
 
-            clear_market_dynamics_cache()
-        except Exception:
-            LOGGER.exception("Failed to clear market dynamics cache after refresh")
-        if self.dojo_sphere_service is not None:
+        if "dojo_market_dynamics" in slugs:
+            try:
+                from dojoagents.dashboard.services.market_dynamics_service import (
+                    clear_market_dynamics_cache,
+                )
+
+                clear_market_dynamics_cache()
+            except Exception:
+                LOGGER.exception("Failed to clear market dynamics cache after refresh")
+
+        sector_dependencies = {
+            "dojo_sector_info",
+            "dojo_sector_symbol_relations",
+            "dojo_sector_precomputed",
+            "dojo_stock_info",
+            "dojo_quote",
+            "dojo_stock_kline",
+        }
+        if self.sector_movers_service is not None and slugs & sector_dependencies:
+            self.sector_movers_service.invalidate()
+
+        if "dojo_sector_precomputed" in slugs:
+            if self.sector_precomputed_store is not None:
+                self.sector_precomputed_store.clear_cache()
+                await self.sector_precomputed_store.reload_async()
+            if self.theme_state_precomputed_store is not None:
+                self.theme_state_precomputed_store.clear_cache()
+                self.theme_state_precomputed_store.reload()
+
+        derived_metric_dependencies = sector_dependencies | {"dojo_benchmark_kline"}
+        if self.dojo_sphere_service is not None and slugs & derived_metric_dependencies:
             await self.dojo_sphere_service.metrics_store.clear_all()
-        if self.sector_precomputed_store is not None:
-            self.sector_precomputed_store.clear_cache()
-            self.sector_precomputed_store.reload()
-        if self.theme_state_precomputed_store is not None:
-            self.theme_state_precomputed_store.clear_cache()
-            self.theme_state_precomputed_store.reload()
-        for store_name in ("stock_store", "benchmark_store"):
+
+        for store_name in reload_stores:
             store = getattr(self, store_name, None)
             if store is not None and hasattr(store, "load"):
                 try:
                     await store.load()
                 except Exception:
-                    LOGGER.exception("Failed to reload %s after market data refresh", store_name)
+                    LOGGER.exception(
+                        "Failed to reload %s after repository update: %s",
+                        store_name,
+                        repo_ids,
+                    )
 
     def reset(self) -> None:
+        self._loaded_store_names.clear()
+        self._lazy_load_locks.clear()
         for name in (
             "client",
             "gateway",

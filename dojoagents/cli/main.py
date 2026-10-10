@@ -249,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.lightweight_runtime:
             services_config = replace(
                 services_config,
-                preload_offline_data=False,
+                ensure_offline_snapshots=False,
                 refresh_enabled=False,
             )
         services = DashboardAppServices(services_config)
