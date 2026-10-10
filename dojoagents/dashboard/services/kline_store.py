@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 
+from dojo import MaterializationLimitError
 from dojo.client.async_client import AsyncDojo
 
 from dojoagents.logging import LOGGER
@@ -33,6 +34,7 @@ from dojoagents.dashboard.services.dojo_data_gateway import (
 from dojoagents.dashboard.services.kline_bar_utils import (
     DATA_START_DATE,
     KLINE_LIMIT,
+    KLINE_WARM_MAX_SYMBOLS,
     # KLINE_MAX_LIMIT,
     normalize_datetime,
     resolve_kline_limit_for_elapsed_days,
@@ -583,20 +585,33 @@ class KlineStore:
             symbols = sorted(set(scopes.get(level) or ()) - already_requested)
             if not symbols:
                 continue
+            already_requested.update(symbols)
+            if len(symbols) > KLINE_WARM_MAX_SYMBOLS:
+                LOGGER.info(
+                    "Skipped kline cache warm before query: sector=%s level=%s symbols=%d max=%d",
+                    path.level3_id,
+                    level,
+                    len(symbols),
+                    KLINE_WARM_MAX_SYMBOLS,
+                )
+                continue
             try:
                 await self.get_klines(symbols, fields=KLINE_OHLCV_FIELDS)
-            except Exception as exc:
-                # Broad scopes (an L1 sector can hold 1.5k+ constituents) may
-                # exceed the offline materialization cap. Cache warming is
-                # best-effort: a failed level must not abort the request.
+            except MaterializationLimitError as exc:
                 LOGGER.warning(
-                    "Skipping kline cache warm for sector %s level=%s (%d symbols): %s",
+                    "Kline cache warm exceeded materialization limit: sector=%s level=%s symbols=%d: %s",
                     path.level3_id,
                     level,
                     len(symbols),
                     exc,
                 )
-            already_requested.update(symbols)
+            except Exception:
+                LOGGER.exception(
+                    "Kline cache warm failed: sector=%s level=%s symbols=%d",
+                    path.level3_id,
+                    level,
+                    len(symbols),
+                )
 
     async def get_sector_klines(
         self,

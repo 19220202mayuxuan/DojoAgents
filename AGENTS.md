@@ -37,7 +37,12 @@ DojoAgents is a quantitative finance agent runtime. It wires an LLM-driven agent
 ├── uv.lock                           # Primary Python lockfile.
 ├── docker/
 │   └── Dockerfile                    # Container packaging.
-├── docs/                             # Architecture, dashboard, protocol, plugin, and planning docs.
+├── docs/                             # Documentation governance and MkDocs source.
+│   ├── README.md                     # Documentation taxonomy and maintenance rules.
+│   └── site/                         # Only publishable documentation source.
+│       ├── assets/                   # Shared images and GIFs.
+│       ├── en/                       # English site: guides, architecture, design, reference, plans.
+│       └── zh/                       # Chinese site with matching relative paths.
 ├── tests/                            # Pytest suite; mirrors agent, dashboard, gateway, plugin, tool surfaces.
 ├── .agents/
 │   └── scripts/                      # REQUIRED location for temporary scripts.
@@ -76,6 +81,14 @@ DojoAgents is a quantitative finance agent runtime. It wires an LLM-driven agent
     │   └── environments/             # Local/Docker/SSH/Modal execution environment adapters.
     └── utils/                        # Shared utility modules such as event bus and fuzzy matching.
 ```
+
+### Documentation Classification (MANDATORY)
+
+- All publishable Markdown belongs under `docs/site/{zh,en}/`; do not add standalone design or plan documents directly under `docs/`.
+- Use `architecture/` for system-wide component relationships and flows, `design/` for current subsystem designs and contracts, `plans/` for proposed or historical implementation work, `reference/` for stable interfaces, and `development/` for contributor procedures.
+- Store shared documentation media under `docs/site/assets/images/` or `docs/site/assets/gifs/`. Do not make site pages depend on assets in frontend source directories.
+- Keep Chinese and English pages at matching relative paths whenever practical, and update `mkdocs.yml` navigation when a published page is added or moved.
+- When a plan is implemented, move durable conclusions into the authoritative architecture, design, reference, or development page and archive or remove obsolete plan text.
 
 ## 3. Core Infrastructure & Utilities (CRITICAL: Do NOT Reinvent)
 

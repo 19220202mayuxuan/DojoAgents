@@ -149,4 +149,4 @@ Dashboard Dojo data gateway errors live in `dojoagents/dashboard/services/dojo_d
 
 ## Further reading
 
-Historical migration notes live under `docs/plans/` (not in site nav).
+Migration notes and capability plans live under [Plans](../plans/index.md); the current contract remains authoritative here.
