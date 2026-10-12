@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import anyio
 import time
 from typing import Any
 from dojoagents.agent.models import ToolCall, ToolResult, ToolResultList
@@ -18,6 +18,7 @@ from dojoagents.tools.registry import ToolRegistry
 from dojoagents.tools.sandbox import SandboxPolicy
 from dojoagents.tools.terminal_tool import truncate_output
 from dojoagents.logging import LOGGER
+from dojoagents.utils.async_runtime import gather_ordered
 
 _MAX_TOOL_RESULT_CHARS = 30000
 
@@ -45,8 +46,9 @@ class ToolExecutor:
         if not tool_calls:
             return results
 
-        tasks = [self.execute_one(call, session_id=session_id) for call in tool_calls]
-        executed_results = await asyncio.gather(*tasks)
+        executed_results = await gather_ordered(
+            [lambda call=call: self.execute_one(call, session_id=session_id) for call in tool_calls]
+        )
         for res in executed_results:
             results.append(res)
         return results
@@ -70,10 +72,8 @@ class ToolExecutor:
         started_at = time.perf_counter()
         try:
             self.sandbox.check_tool(call.name)
-            raw = await asyncio.wait_for(
-                spec.handler(dict(call.arguments)),
-                timeout=self.sandbox.timeout_seconds,
-            )
+            with anyio.fail_after(self.sandbox.timeout_seconds):
+                raw = await spec.handler(dict(call.arguments))
             latency_ms = int((time.perf_counter() - started_at) * 1000)
             return self._coerce_result(call, raw, session_id=session_id, latency_ms=latency_ms)
         except AgentEscalationError as exc:
@@ -91,6 +91,33 @@ class ToolExecutor:
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
                 metadata=escalation_metadata(exc, source_tool=call.name),
             )
+        except TimeoutError:
+            timeout_seconds = self.sandbox.timeout_seconds
+            LOGGER.warning(
+                "Tool '%s' timed out after %ss (call_id: %s)",
+                call.name,
+                timeout_seconds,
+                call.id,
+            )
+            return ToolResult(
+                call_id=call.id,
+                name=call.name,
+                ok=False,
+                error=f"Tool '{call.name}' timed out after {timeout_seconds:g} seconds",
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+            )
+        except BaseExceptionGroup as exc:
+            cancelled, remainder = exc.split(anyio.get_cancelled_exc_class())
+            if cancelled is not None:
+                raise cancelled
+            LOGGER.exception("Grouped error executing tool '%s' (call_id: %s)", call.name, call.id)
+            return ToolResult(
+                call_id=call.id,
+                name=call.name,
+                ok=False,
+                error=str(remainder or exc),
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+            )
         except Exception as exc:
             LOGGER.exception(f"Error executing tool '{call.name}' (call_id: {call.id})")
             return ToolResult(
@@ -98,6 +125,7 @@ class ToolExecutor:
                 name=call.name,
                 ok=False,
                 error=str(exc),
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
             )
         finally:
             active_session_id.reset(token)

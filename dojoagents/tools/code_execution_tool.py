@@ -1,4 +1,4 @@
-import asyncio
+import anyio
 import json
 import os
 import re
@@ -7,13 +7,15 @@ import tempfile
 from collections.abc import Sequence
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from dojoagents.tools.artifacts import (
     ToolResultArtifactAdapter,
     ToolResultArtifactStore,
 )
 from dojoagents.logging import get_logger
+from dojoagents.tools import processes
+from dojoagents.tools.af_unix_asyncio_compat import start_unix_server
 from dojoagents.tools.dojo_tools_stub import (
     HERMES_INTERNAL_LIST_TOOLS,
     HERMES_INTERNAL_LOAD_TOOL,
@@ -119,10 +121,22 @@ def _bounded_text(value: Any, limit: int) -> tuple[str, int, bool]:
     return text[:limit], len(text), len(text) > limit
 
 
+class _AsyncByteReader(Protocol):
+    """Minimal stream-read surface used by the execute_code RPC framing.
+
+    The RPC endpoint comes from :mod:`dojoagents.tools.af_unix_asyncio_compat`,
+    so the concrete reader is an ``asyncio`` stream on POSIX and a compatibility
+    stream on Windows.  Only ``read()`` is used here, which keeps the framing
+    class independent of either implementation.
+    """
+
+    async def read(self, n: int = -1) -> bytes: ...
+
+
 class RpcJsonLineProtocol:
     """Buffered newline-delimited JSON framing for execute_code RPC."""
 
-    def __init__(self, reader: asyncio.StreamReader, *, max_size: int = RPC_MAX_MESSAGE_BYTES) -> None:
+    def __init__(self, reader: _AsyncByteReader, *, max_size: int = RPC_MAX_MESSAGE_BYTES) -> None:
         self._reader = reader
         self._buffer = bytearray()
         self._max_size = max_size
@@ -257,14 +271,6 @@ def _build_execute_code_data(session_output_files: list[dict[str, Any]]) -> dict
     data: dict[str, Any] = {"session_output_files": session_output_files}
     data.update(session_output_files[-1])
     return data
-
-
-if sys.platform == "win32":
-    import dojoagents.tools.af_unix_asyncio_compat as af_unix_asyncio_compat
-
-    start_unix_server = af_unix_asyncio_compat.start_unix_server
-else:
-    start_unix_server = asyncio.start_unix_server
 
 
 class AsyncCodeExecutionRPC:
@@ -562,17 +568,23 @@ async def handle_code_execution(
             env["DOJO_SESSIONS_ROOT"] = str(sessions_root_path)
             env["DOJO_SESSION_OUTPUT_DIR"] = str(output_dir)
             env["DOJO_SESSION_INPUT_DIR"] = str(input_dir.resolve())
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        script_file,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+    proc = await processes.open_process(
+        [sys.executable, script_file],
+        stdin=processes.INHERIT,
+        stdout=processes.PIPE,
+        stderr=processes.STDOUT,
         env=env,
     )
 
     try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=300.0)
+        with anyio.fail_after(300.0):
+            stdout, _ = await proc.communicate()
         output = stdout.decode("utf-8", errors="replace")
+    except BaseException:
+        # The RPC child must never outlive the call that started it: a timeout or
+        # a cancelled parent has to reap it (shielded, so cleanup still runs).
+        await processes.terminate_then_kill(proc)
+        raise
     finally:
         await rpc_server.stop()
 

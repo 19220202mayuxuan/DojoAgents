@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -43,14 +44,18 @@ async def _run_one_iteration(
         mock_datetime.datetime.now.return_value = now
         mock_datetime.time = datetime.time
         mock_datetime.timedelta = datetime.timedelta
-        with patch("asyncio.sleep", side_effect=_cancel_after_first_sleep):
-            await start_refresh_loop(
-                runtime_dir=tmp_path,
-                store_registry=registry,
-                poll_interval=1,
-                paths=[KLINE_PATH],
-                hot_paths=hot_paths or [],
-            )
+        with patch(
+            "dojoagents.dashboard.services.market_refresh_jobs.anyio.sleep",
+            side_effect=_cancel_after_first_sleep,
+        ):
+            with contextlib.suppress(asyncio.CancelledError):
+                await start_refresh_loop(
+                    runtime_dir=tmp_path,
+                    store_registry=registry,
+                    poll_interval=1,
+                    paths=[KLINE_PATH],
+                    hot_paths=hot_paths or [],
+                )
 
 
 @pytest.mark.asyncio
@@ -152,14 +157,18 @@ async def test_start_refresh_loop_checks_hot_snapshot_after_daily_sync(tmp_path)
         mock_datetime.datetime.now.return_value = datetime.datetime(2026, 6, 29, 10, 0)
         mock_datetime.time = datetime.time
         mock_datetime.timedelta = datetime.timedelta
-        with patch("asyncio.sleep", side_effect=_cancel_after_first_sleep):
-            await start_refresh_loop(
-                runtime_dir=tmp_path,
-                registry=registry,
-                poll_interval=1,
-                paths=[KLINE_PATH, hot_path],
-                hot_paths=[hot_path],
-            )
+        with patch(
+            "dojoagents.dashboard.services.market_refresh_jobs.anyio.sleep",
+            side_effect=_cancel_after_first_sleep,
+        ):
+                with contextlib.suppress(asyncio.CancelledError):
+                    await start_refresh_loop(
+                        runtime_dir=tmp_path,
+                        registry=registry,
+                        poll_interval=1,
+                        paths=[KLINE_PATH, hot_path],
+                        hot_paths=[hot_path],
+                    )
 
     client.sync_offline_snapshots.assert_awaited_once_with(
         paths=[hot_path],

@@ -12,6 +12,7 @@ description = "AI Agent"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "anyio>=4.8,<5",
     "openai>=1.20.0,<2",
     "fastapi>=0.115.2,<0.116",
     "uvicorn>=0.31.1,<0.36.0",

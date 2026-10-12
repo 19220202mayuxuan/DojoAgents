@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import uuid
 from datetime import date, datetime, timezone
 from typing import Callable, List, Optional
+from dojoagents.utils.async_runtime import gather_ordered
 
 from dojoagents.dashboard.services.portfolio_allocation import (
     resolve_cost_date,
@@ -32,6 +32,7 @@ from dojoagents.dashboard.services.domain_utils import normalize_market_code
 from dojoagents.dashboard.services.stock_sector_store import StockSectorStore
 from dojoagents.dashboard.services.stock_store import StockStore
 from dojoagents.dashboard.services.ticker_symbol_resolution import resolve_ticker_symbol
+from dojoagents.utils.async_runtime import SyncWorkload, run_sync_bounded
 from dojoagents.dashboard.schemas.portfolio import (
     AddPortfolioHoldingRequest,
     AutoAllocateRequest,
@@ -294,7 +295,12 @@ class PortfolioService:
 
     async def _store_call(self, method_name: str, *args, **kwargs):
         method = getattr(self.store, method_name)
-        return await asyncio.to_thread(method, *args, **kwargs)
+        return await run_sync_bounded(
+            method,
+            *args,
+            workload=SyncWorkload.SDK_IO,
+            **kwargs,
+        )
 
     def _resolve_holding_ticker(
         self,
@@ -1049,7 +1055,9 @@ class PortfolioService:
             return None
 
         series = {}
-        for built in await asyncio.gather(*(build_market_series(market) for market in MARKETS)):
+        for built in await gather_ordered(
+            [lambda market=market: build_market_series(market) for market in MARKETS]
+        ):
             if built is None:
                 continue
             market, result = built
@@ -1088,7 +1096,9 @@ class PortfolioService:
                 return None
             return market, result, points
 
-        for built in await asyncio.gather(*(build_candidate_market_series(market) for market in MARKETS)):
+        for built in await gather_ordered(
+            [lambda market=market: build_candidate_market_series(market) for market in MARKETS]
+        ):
             if built is None:
                 continue
             market, result, points = built

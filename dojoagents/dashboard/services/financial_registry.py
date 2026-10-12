@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import anyio
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +24,7 @@ from dojoagents.dashboard.services.sector_movers_service import SectorMoversServ
 from dojoagents.dashboard.services.sector_precomputed_store import SectorPrecomputedStore
 from dojoagents.dashboard.services.theme_state_precomputed_store import ThemeStatePrecomputedStore
 from dojoagents.logging import LOGGER
+from dojoagents.utils.async_runtime import gather_ordered
 
 PRELOAD_PHASES: tuple[tuple[str, ...], ...] = (
     (
@@ -82,7 +83,7 @@ class FinancialDomainRegistry:
         self.sector_movers_service: Optional[SectorMoversService] = None
         self.refresh_store = None
         self._loaded_store_names: set[str] = set()
-        self._lazy_load_locks: dict[str, asyncio.Lock] = {}
+        self._lazy_load_locks: dict[str, anyio.Lock] = {}
 
     async def init_and_load_all(
         self,
@@ -168,7 +169,7 @@ class FinancialDomainRegistry:
         phases = [store_names] if store_names is not None else PRELOAD_PHASES
         errors: list[Exception] = []
         for phase_idx, phase in enumerate(phases, 1):
-            tasks = []
+            operations = []
 
             async def _load_store(name: str, inst: Any) -> Any:
                 LOGGER.debug(f"开始加载 Store: {name} ...")
@@ -183,24 +184,29 @@ class FinancialDomainRegistry:
             for store_name in phase:
                 store_inst = getattr(self, store_name)
                 if hasattr(store_inst, "load") and callable(store_inst.load):
-                    tasks.append(_load_store(store_name, store_inst))
-            if not tasks:
+                    operations.append(
+                        lambda store_name=store_name, store_inst=store_inst: _load_store(store_name, store_inst)
+                    )
+            if not operations:
                 continue
 
             if tqdm is not None:
-                pbar = tqdm(total=len(tasks), desc=f"Registry Preload Phase {phase_idx}")
+                pbar = tqdm(total=len(operations), desc=f"Registry Preload Phase {phase_idx}")
 
-                async def _wrap_task(task):
+                async def _wrap_operation(operation):
                     try:
-                        return await task
+                        return await operation()
                     finally:
                         pbar.update(1)
 
-                wrapped_tasks = [_wrap_task(t) for t in tasks]
-                results = await asyncio.gather(*wrapped_tasks, return_exceptions=True)
+                wrapped_operations = [
+                    lambda operation=operation: _wrap_operation(operation)
+                    for operation in operations
+                ]
+                results = await gather_ordered(wrapped_operations, return_exceptions=True)
                 pbar.close()
             else:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                results = await gather_ordered(operations, return_exceptions=True)
 
             for res in results:
                 if isinstance(res, Exception):
@@ -221,7 +227,7 @@ class FinancialDomainRegistry:
             store = getattr(self, name, None)
             if store is None or not callable(getattr(store, "load", None)):
                 raise RuntimeError(f"{name} is not initialized or loadable")
-            lock = self._lazy_load_locks.setdefault(name, asyncio.Lock())
+            lock = self._lazy_load_locks.setdefault(name, anyio.Lock())
             async with lock:
                 if name in self._loaded_store_names:
                     continue

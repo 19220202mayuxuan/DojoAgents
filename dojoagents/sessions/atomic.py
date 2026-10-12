@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import tempfile
@@ -68,7 +67,6 @@ class AtomicJsonStore:
     def __init__(self, root: Path, *, schema_version: int) -> None:
         self.root = root.resolve()
         self.schema_version = schema_version
-        self._locks: dict[str, asyncio.Lock] = {}
 
     def path_for(self, key: str) -> Path:
         return _safe_key_path(self.root, key, self.suffix)
