@@ -5,12 +5,9 @@ from typing import Any
 
 import anyio
 
-from dojoagents.logging import get_logger
+from dojoagents.logging import LOGGER
 from dojoagents.memory.file_io import atomic_write_text, read_text_if_present
 from dojoagents.memory.path_names import bounded_session_name
-
-
-LOGGER = get_logger(__name__)
 
 
 class LocalMemoryProvider:
