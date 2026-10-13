@@ -8,17 +8,17 @@ from dojoagents.tools.escalation import AgentEscalationError, escalation_metadat
 from dojoagents.tools.artifacts import (
     ARTIFACT_PERSIST_THRESHOLD_CHARS,
     ARTIFACT_KEEP_FULL_CONTENT_TOOLS,
-    ARTIFACT_MAX_CONTENT_CHARS,
     structured_artifact_data,
     ToolResultArtifactAdapter,
     ToolResultArtifactStore,
     build_artifact_pointer_message,
 )
+from dojoagents.sessions.atomic import FileStoreSizeError
 from dojoagents.tools.registry import ToolRegistry
 from dojoagents.tools.sandbox import SandboxPolicy
 from dojoagents.tools.terminal_tool import truncate_output
 from dojoagents.logging import LOGGER
-from dojoagents.utils.async_runtime import gather_ordered
+from dojoagents.utils.async_runtime import SyncWorkload, gather_ordered, run_sync_bounded
 
 _MAX_TOOL_RESULT_CHARS = 30000
 
@@ -75,7 +75,7 @@ class ToolExecutor:
             with anyio.fail_after(self.sandbox.timeout_seconds):
                 raw = await spec.handler(dict(call.arguments))
             latency_ms = int((time.perf_counter() - started_at) * 1000)
-            return self._coerce_result(call, raw, session_id=session_id, latency_ms=latency_ms)
+            return await self._coerce_result(call, raw, session_id=session_id, latency_ms=latency_ms)
         except AgentEscalationError as exc:
             LOGGER.info(
                 "Tool '%s' escalated to user input (call_id: %s, code: %s)",
@@ -130,7 +130,7 @@ class ToolExecutor:
         finally:
             active_session_id.reset(token)
 
-    def _coerce_result(
+    async def _coerce_result(
         self,
         call: ToolCall,
         raw: dict[str, Any] | str | None,
@@ -181,13 +181,24 @@ class ToolExecutor:
                 if not error:
                     error = content.strip() or f"Process exited with code {exit_code_int}"
 
-        persist_artifact = self.artifact_store is not None and bool(session_id) and ARTIFACT_PERSIST_THRESHOLD_CHARS <= len(original_content) <= ARTIFACT_MAX_CONTENT_CHARS
+        persist_artifact = (
+            self.artifact_store is not None
+            and bool(session_id)
+            and len(original_content) >= ARTIFACT_PERSIST_THRESHOLD_CHARS
+        )
         if persist_artifact:
             try:
                 artifact_data = normalized.get("data")
                 if self.artifact_adapter is not None:
-                    artifact_data = self.artifact_adapter.extract_data(call.name, original_content, artifact_data)
-                artifact_path = self.artifact_store.save(
+                    artifact_data = await run_sync_bounded(
+                        self.artifact_adapter.extract_data,
+                        call.name,
+                        original_content,
+                        artifact_data,
+                        workload=SyncWorkload.CPU,
+                    )
+                artifact_path = await run_sync_bounded(
+                    self.artifact_store.save,
                     session_id=session_id,
                     call_id=call.id,
                     tool_name=call.name,
@@ -198,22 +209,31 @@ class ToolExecutor:
                     truncated=source_truncated,
                     error=error,
                 )
+            except FileStoreSizeError:
+                raise
             except Exception:
                 LOGGER.exception("Failed to persist tool result artifact: session_id=%s call_id=%s tool=%s", session_id, call.id, call.name)
             else:
                 metadata["artifact_path"] = str(artifact_path)
                 metadata["artifact_call_id"] = call.id
                 if ok and call.name in self.pointer_tools and call.name not in ARTIFACT_KEEP_FULL_CONTENT_TOOLS:
-                    source = structured_artifact_data(artifact_data, original_content)
+                    source = await run_sync_bounded(
+                        structured_artifact_data,
+                        artifact_data,
+                        original_content,
+                        workload=SyncWorkload.CPU,
+                    )
                     if source is not None:
                         try:
                             pointer_builder = self.artifact_adapter.build_pointer if self.artifact_adapter is not None else build_artifact_pointer_message
-                            content = pointer_builder(
+                            content = await run_sync_bounded(
+                                pointer_builder,
                                 tool_name=call.name,
                                 call_id=call.id,
                                 arguments=dict(call.arguments),
                                 data=source,
                                 content=original_content,
+                                workload=SyncWorkload.CPU,
                             )
                             normalized["truncated"] = source_truncated
                         except Exception:

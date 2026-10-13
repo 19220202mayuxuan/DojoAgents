@@ -6,11 +6,17 @@ import json
 import os
 import tempfile
 import time
+from collections.abc import Iterable
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
 
 class FileStoreError(RuntimeError):
+    pass
+
+
+class FileStoreSizeError(FileStoreError):
     pass
 
 
@@ -34,13 +40,19 @@ def _safe_key_path(root: Path, key: str, suffix: str) -> Path:
     return path.with_name(f"{path.name}{suffix}")
 
 
-def _atomic_write_bytes(path: Path, content: bytes) -> None:
+def _atomic_write_bytes(path: Path, content: bytes | Iterable[bytes], *, max_bytes: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False) as handle:
             temporary = Path(handle.name)
-            handle.write(content)
+            size = 0
+            chunks = (content,) if isinstance(content, bytes) else content
+            for chunk in chunks:
+                size += len(chunk)
+                if max_bytes is not None and size > max_bytes:
+                    raise FileStoreSizeError(f"JSON file exceeds {max_bytes} byte limit; larger payloads are unsupported")
+                handle.write(chunk)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
@@ -54,11 +66,9 @@ def _atomic_write_text(path: Path, content: str) -> None:
     _atomic_write_bytes(path, content.encode("utf-8"))
 
 
-def _atomic_write_json(path: Path, data: Any) -> None:
-    _atomic_write_text(
-        path,
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-    )
+def _atomic_write_json(path: Path, data: Any, *, max_bytes: int | None = None) -> None:
+    chunks = (chunk.encode("utf-8") for chunk in json.JSONEncoder(ensure_ascii=False, indent=2).iterencode(data))
+    _atomic_write_bytes(path, chain(chunks, (b"\n",)), max_bytes=max_bytes)
 
 
 class AtomicJsonStore:

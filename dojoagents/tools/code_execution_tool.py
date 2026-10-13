@@ -9,7 +9,9 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Protocol
 
+from dojoagents.sessions.atomic import FileStoreSizeError
 from dojoagents.tools.artifacts import (
+    ARTIFACT_MAX_BYTES,
     ToolResultArtifactAdapter,
     ToolResultArtifactStore,
 )
@@ -25,6 +27,7 @@ from dojoagents.tools.dojo_tools_runtime import format_execute_code_error_hint
 from dojoagents.tools.process_registry import active_session_id
 from dojoagents.tools.registry import ToolSpec
 from dojoagents.tools.sandbox import SandboxPolicy
+from dojoagents.utils.async_runtime import SyncWorkload, run_sync_bounded
 
 LOGGER = get_logger(__name__)
 
@@ -73,7 +76,7 @@ def _wrap_execute_code(code_content: str, preload_packages: Sequence[str] | None
 
 # asyncio StreamReader.readline() defaults to 64 KiB per line; execute_code RPC carries
 # full tool args/responses as one JSON line and must support large write_session_file payloads.
-RPC_MAX_MESSAGE_BYTES = 32 * 1024 * 1024
+RPC_MAX_MESSAGE_BYTES = ARTIFACT_MAX_BYTES
 _NESTED_FAILURE_ERROR_CHARS = 2000
 _SAFE_SUBPROCESS_ENV = (
     "PATH",
@@ -300,9 +303,9 @@ class AsyncCodeExecutionRPC:
 
     async def _dispatch_tool(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
         if tool_name == HERMES_INTERNAL_LOAD_TOOL:
-            return self._load_tool_result(args)
+            return await run_sync_bounded(self._load_tool_result, args)
         if tool_name == HERMES_INTERNAL_LIST_TOOLS:
-            return self._list_tool_results()
+            return await run_sync_bounded(self._list_tool_results)
 
         spec = self.tool_registry.get(tool_name)
         if spec is None:
@@ -444,6 +447,8 @@ class AsyncCodeExecutionRPC:
                     truncated=bool(response.get("truncated")),
                     error=str(raw_error),
                 )
+            except FileStoreSizeError as exc:
+                diagnostic["response_artifact_error"] = str(exc)
             except Exception:
                 LOGGER.exception("Failed to persist nested execute_code tool failure: %s", tool_name)
             else:
@@ -479,13 +484,19 @@ class AsyncCodeExecutionRPC:
 
                 # This is deliberately response-based: arbitrary child stdout is not a tool failure signal.
                 if response.get("ok") is False:
-                    self._record_nested_tool_failure(
+                    await run_sync_bounded(
+                        self._record_nested_tool_failure,
                         tool_name=str(tool_name or ""),
                         args=dict(args or {}),
                         response=response,
                     )
 
-                writer.write(RpcJsonLineProtocol.encode_message(response))
+                encoded = await run_sync_bounded(
+                    RpcJsonLineProtocol.encode_message,
+                    response,
+                    workload=SyncWorkload.CPU,
+                )
+                writer.write(encoded)
                 await writer.drain()
         except Exception:
             LOGGER.exception("execute_code RPC client handler failed")
