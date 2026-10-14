@@ -6,6 +6,8 @@ import hashlib
 import json
 import shutil
 import asyncio
+import logging
+import math
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -29,6 +31,7 @@ from dojoagents.dashboard.services.sector_return_coverage import sector_day_retu
 from dojoagents.dashboard.services.sector_store import ResolvedSectorPath, SectorStore
 from dojoagents.dashboard.services.stock_sector_store import MARKETS, StockSectorStore
 from dojoagents.dashboard.services.stock_store import StockStore
+from dojoagents.logging import LOGGER
 
 ProgressCallback = Callable[[str, int, int], None]
 
@@ -238,6 +241,17 @@ async def prepare_sector_precompute_input(
     window_end_d = date.fromisoformat(str(end_date or date.today().isoformat())[:10])
     window_days = max(1, (window_end_d - date.fromisoformat(working_start[:10])).days + 1)
     batch_size = max(50, min(KLINE_SYMBOL_BATCH_SIZE, 80_000 // window_days))
+    LOGGER.debug(
+        "precompute_kline_window market=%s start_date=%s lookback_start=%s working_start=%s end_date=%s symbols=%d batch_size=%d candidate_stats=%s",
+        market,
+        start_date,
+        lookback_start,
+        working_start,
+        end_date,
+        kline_total,
+        batch_size,
+        stats,
+    )
     for source_market, symbols in symbols_by_market.items():
         get_batch = getattr(kline_store, "get_klines", None)
         if callable(get_batch):
@@ -253,12 +267,20 @@ async def prepare_sector_precompute_input(
                     refresh=True,
                     fields=KLINE_ELIGIBILITY_FIELDS,
                 )
-                response_by_ticker.update(
-                    {
-                        (source_market, symbol): response
-                        for symbol, response in batch.items.items()
-                    }
-                )
+                if LOGGER.isEnabledFor(logging.DEBUG):
+                    dates = [str(bar.bar_time)[:10] for response in batch.items.values() for bar in response.bars]
+                    LOGGER.debug(
+                        "precompute_kline_batch market=%s offset=%d requested=%d returned=%d bars=%d min_date=%s max_date=%s symbols_in_window=%d",
+                        source_market,
+                        offset,
+                        len(symbol_batch),
+                        len(batch.items),
+                        len(dates),
+                        min(dates, default=None),
+                        max(dates, default=None),
+                        sum(any(str(bar.bar_time)[:10] >= start_date for bar in response.bars) for response in batch.items.values()),
+                    )
+                response_by_ticker.update({(source_market, symbol): response for symbol, response in batch.items.items()})
                 kline_progress += len(symbol_batch)
                 if on_progress is not None:
                     on_progress("kline", kline_progress, max(kline_total, 1))
@@ -330,6 +352,15 @@ async def prepare_sector_precompute_input(
                 }
             )
 
+    LOGGER.debug(
+        "precompute_input_ready start_date=%s end_date=%s constituents=%d tickers=%d selected_bars=%d stats=%s",
+        start_date,
+        end_date,
+        len(constituents),
+        len(seen_tickers),
+        len(ticker_daily_rows),
+        stats,
+    )
     return PrecomputeInputSnapshot(
         start_date=start_date,
         end_date=end_date,
@@ -347,12 +378,34 @@ def _compute_ticker_daily(snapshot: PrecomputeInputSnapshot) -> pd.DataFrame:
 
     frame = frame.sort_values(["market", "ticker", "trade_date"])
     frame["trade_date"] = frame["trade_date"].astype(str)
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        first_dates = frame.groupby(["market", "ticker"])["trade_date"].min()
+        LOGGER.debug(
+            "precompute_ticker_input start_date=%s rows=%d tickers=%d min_date=%s max_date=%s tickers_without_baseline=%d",
+            snapshot.start_date,
+            len(frame),
+            len(first_dates),
+            frame["trade_date"].min(),
+            frame["trade_date"].max(),
+            int((first_dates >= snapshot.start_date).sum()),
+        )
     frame["daily_return_pct"] = frame.groupby(["market", "ticker"])["close"].pct_change() * 100.0
     first_close = frame.groupby(["market", "ticker"])["close"].transform("first")
     frame["cumulative_return_pct"] = ((frame["close"] / first_close - 1.0) * 100.0).where(first_close > 0)
     frame = frame[frame["trade_date"] >= snapshot.start_date]
     frame["daily_return_pct"] = frame["daily_return_pct"].round(4)
     frame["cumulative_return_pct"] = frame["cumulative_return_pct"].round(4)
+    if LOGGER.isEnabledFor(logging.DEBUG):
+        LOGGER.debug(
+            "precompute_ticker_window start_date=%s rows=%d min_date=%s max_date=%s missing_returns=%d nonfinite_returns=%d finite_returns=%d",
+            snapshot.start_date,
+            len(frame),
+            frame["trade_date"].min(),
+            frame["trade_date"].max(),
+            int(frame["daily_return_pct"].isna().sum()),
+            int(frame["daily_return_pct"].map(lambda value: pd.notna(value) and not math.isfinite(value)).sum()),
+            int(frame["daily_return_pct"].map(math.isfinite).sum()),
+        )
     return frame[TICKER_DAILY_COLUMNS]
 
 
@@ -379,6 +432,13 @@ def _build_index_rows(
     tickers = [(str(row["market"]), str(row["ticker"])) for _, row in members.iterrows()]
     valid_columns = [column for column in tickers if column in returns_pivot.columns]
     if not valid_columns:
+        LOGGER.debug(
+            "precompute_sector_group scope=%s market=%s path=%s members=%d rows=0 rejected=no_return_columns",
+            scope,
+            market,
+            (path.level1_id, path.level2_id, path.level3_id),
+            len(members),
+        )
         return []
 
     member_count = int(len({ticker for _, ticker in valid_columns}))
@@ -387,6 +447,7 @@ def _build_index_rows(
     weights = {(str(row["market"]), str(row["ticker"])): float(row["market_cap"]) for _, row in members.iterrows()}
 
     rows: list[dict[str, Any]] = []
+    rejected = {"no_returns": 0, "outliers": 0, "zero_weight": 0, "coverage": 0}
     index_level = 100.0
     for trade_date in returns_pivot.index:
         available: list[tuple[float, float]] = []
@@ -399,14 +460,17 @@ def _build_index_rows(
                 continue
             available.append((float(value), weight))
         if not available:
+            rejected["no_returns"] += 1
             continue
         # Drop extreme single-name days; keep the constituent in the basket, but omit
         # that return and re-normalize weights over the remaining names.
         usable = [(value, weight) for value, weight in available if sector_member_daily_return_usable(value / 100.0)]
         if not usable:
+            rejected["outliers"] += 1
             continue
         effective_weight_sum = float(sum(weight for _, weight in usable))
         if effective_weight_sum == 0:
+            rejected["zero_weight"] += 1
             continue
         # Sparse sessions (few names / little cap) are data gaps, not sector prints.
         if not sector_day_return_coverage_ok(
@@ -415,6 +479,7 @@ def _build_index_rows(
             total_market_cap=total_market_cap,
             effective_weight_sum=effective_weight_sum,
         ):
+            rejected["coverage"] += 1
             continue
         daily_return_pct = sum(value * weight for value, weight in usable) / effective_weight_sum
         index_level *= 1 + daily_return_pct / 100.0
@@ -435,6 +500,17 @@ def _build_index_rows(
                 "daily_return_pct": round(daily_return_pct, 4),
             }
         )
+    LOGGER.debug(
+        "precompute_sector_group scope=%s market=%s path=%s members=%d return_columns=%d days=%d rows=%d rejected=%s",
+        scope,
+        market,
+        (path.level1_id, path.level2_id, path.level3_id),
+        len(members),
+        len(valid_columns),
+        len(returns_pivot.index),
+        len(rows),
+        rejected,
+    )
     return rows
 
 
@@ -451,6 +527,14 @@ def compute_sector_precomputed_frames(snapshot: PrecomputeInputSnapshot) -> tupl
         values="daily_return_pct",
         aggfunc="last",
     ).sort_index()
+    LOGGER.debug(
+        "precompute_return_matrix start_date=%s constituents=%d ticker_rows=%d days=%d columns=%d",
+        snapshot.start_date,
+        len(constituents_df),
+        len(ticker_daily_df),
+        len(returns_pivot.index),
+        len(returns_pivot.columns),
+    )
 
     sector_daily_rows: list[dict[str, Any]] = []
     l3_groups = constituents_df.groupby(["market", "level1_id", "level2_id", "level3_id"], sort=True)
@@ -523,7 +607,19 @@ def compute_sector_precomputed_frames(snapshot: PrecomputeInputSnapshot) -> tupl
         )
 
     sector_daily_df = pd.DataFrame(sector_daily_rows)
+    LOGGER.debug("precompute_sector_output start_date=%s rows=%d", snapshot.start_date, len(sector_daily_df))
     if sector_daily_df.empty:
+        LOGGER.warning(
+            "precompute_empty_sector_output start_date=%s end_date=%s input_bars=%d ticker_rows=%d return_days=%d return_columns=%d constituents=%d stats=%s",
+            snapshot.start_date,
+            snapshot.end_date,
+            len(snapshot.ticker_daily_rows),
+            len(ticker_daily_df),
+            len(returns_pivot.index),
+            len(returns_pivot.columns),
+            len(constituents_df),
+            snapshot.stats,
+        )
         raise ValueError("Sector daily output is empty; refusing to publish an empty snapshot.")
     sector_daily_df = sector_daily_df[SECTOR_DAILY_COLUMNS]
 

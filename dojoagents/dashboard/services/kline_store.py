@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -256,10 +257,7 @@ class KlineStore:
             repo_id=key.repo_id,
         )
         self._cache_estimated_bytes += estimated_bytes
-        while (
-            len(self._cache) > self._cache_max_entries
-            or self._cache_estimated_bytes > self._cache_max_bytes
-        ):
+        while len(self._cache) > self._cache_max_entries or self._cache_estimated_bytes > self._cache_max_bytes:
             _, evicted = self._cache.popitem(last=False)
             self._cache_estimated_bytes -= evicted.estimated_bytes
 
@@ -272,20 +270,12 @@ class KlineStore:
         if not targets:
             return 0
         target_slugs = {repo_id.rsplit("/", 1)[-1].lower() for repo_id in targets}
-        keys = [
-            key
-            for key, entry in self._cache.items()
-            if entry.repo_id in targets
-            or entry.repo_id.rsplit("/", 1)[-1].lower() in target_slugs
-        ]
+        keys = [key for key, entry in self._cache.items() if entry.repo_id in targets or entry.repo_id.rsplit("/", 1)[-1].lower() in target_slugs]
         for key in keys:
             entry = self._cache.pop(key)
             self._cache_estimated_bytes -= entry.estimated_bytes
         active_repo = (self.snapshot_metadata or {}).get("repo_id")
-        if active_repo and (
-            active_repo in targets
-            or active_repo.rsplit("/", 1)[-1].lower() in target_slugs
-        ):
+        if active_repo and (active_repo in targets or active_repo.rsplit("/", 1)[-1].lower() in target_slugs):
             self.snapshot_metadata = None
             self._active_snapshot_token = None
         return len(keys)
@@ -458,9 +448,7 @@ class KlineStore:
         )
 
     async def get_kline(self, symbol: str, limit: int | None = None) -> Optional[StockKlineResponse]:
-        return await self.get_or_fetch_kline(
-            symbol, limit=limit, fields=KLINE_OHLCV_FIELDS
-        )
+        return await self.get_or_fetch_kline(symbol, limit=limit, fields=KLINE_OHLCV_FIELDS)
 
     async def load(self, limit: int | None = None) -> None:
         del limit
@@ -534,6 +522,17 @@ class KlineStore:
         # _prepare_kline_df on the full multi-symbol frame per ticker was O(N^2)
         # and blocked the agent event loop (dojo-agent-runs) under GIL.
         prepared = _prepare_kline_df(self._to_frame(results.data), symbol="")
+        if LOGGER.isEnabledFor(logging.DEBUG):
+            dates = prepared.get("bar_time", pd.Series(dtype=str))
+            LOGGER.debug(
+                "dojo_kline_normalized market=%s rows=%d symbols=%d min_date=%s max_date=%s refresh=%s",
+                market,
+                len(prepared),
+                prepared["symbol"].nunique() if "symbol" in prepared else 0,
+                dates.min() if len(dates) else None,
+                dates.max() if len(dates) else None,
+                refresh,
+            )
         if prepared.empty or "symbol" not in prepared.columns:
             return ConstituentKlineBatchResponse(as_of=None, items={})
 
@@ -655,11 +654,7 @@ class KlineStore:
 
     async def stats(self) -> ConstituentKlineStatsResponse:
         self._purge_expired_cache_entries()
-        cached_symbols = {
-            symbol
-            for key in self._cache
-            for symbol in key.symbols
-        }
+        cached_symbols = {symbol for key in self._cache for symbol in key.symbols}
         return ConstituentKlineStatsResponse(
             member_symbols=self.member_symbols,
             tracked_symbols=len(cached_symbols),
