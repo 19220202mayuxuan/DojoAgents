@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-import asyncio
 import logging
 import math
 from dataclasses import dataclass
@@ -32,6 +31,7 @@ from dojoagents.dashboard.services.sector_store import ResolvedSectorPath, Secto
 from dojoagents.dashboard.services.stock_sector_store import MARKETS, StockSectorStore
 from dojoagents.dashboard.services.stock_store import StockStore
 from dojoagents.logging import LOGGER
+from dojoagents.utils.async_runtime import SyncWorkload, run_sync_bounded
 
 ProgressCallback = Callable[[str, int, int], None]
 
@@ -803,16 +803,17 @@ async def build_sector_precomputed(
     )
     if on_progress is not None:
         on_progress("compute", 0, 1)
-    manifest, staging_dir = await asyncio.to_thread(
+    manifest, staging_dir = await run_sync_bounded(
         compute_and_stage_sector_precomputed,
         snapshot,
         out_dir,
         market,
+        workload=SyncWorkload.CPU,
     )
     if on_progress is not None:
         on_progress("compute", 1, 1)
         on_progress("publish", 0, 1)
-    published_dir = await asyncio.to_thread(
+    published_dir = await run_sync_bounded(
         publish_staged_sector_precomputed,
         staging_dir,
         out_dir,

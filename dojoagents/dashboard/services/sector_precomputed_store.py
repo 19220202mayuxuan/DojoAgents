@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from bisect import bisect_right
 from collections import OrderedDict
@@ -31,6 +30,7 @@ from dojoagents.dashboard.services.sector_return_coverage import (
 )
 from dojoagents.dashboard.services.stock_quote_filter import filter_constituents_frame_by_ticker_cap_min
 from dojoagents.logging import LOGGER
+from dojoagents.utils.async_runtime import run_sync_bounded
 
 
 def _clip_daily_frame_for_window(
@@ -217,14 +217,14 @@ class SectorPrecomputedStore:
                     paths=list(SDK_PRECOMPUTED_PATHS)
                 )
                 if snapshots:
-                    await asyncio.to_thread(self._load_sdk_snapshot, snapshots[0])
+                    await run_sync_bounded(self._load_sdk_snapshot, snapshots[0])
                     return
             except Exception as exc:
                 LOGGER.warning(
                     "Failed to load SDK sector-precomputed snapshot; falling back to Dashboard publish: %s",
                     exc,
                 )
-        await asyncio.to_thread(self.reload, dataset_dir)
+        await run_sync_bounded(self.reload, dataset_dir)
 
     def _load_sdk_snapshot(self, snapshot: Any) -> None:
         files = {str(item.relative_path): Path(item.local_path) for item in snapshot.files}

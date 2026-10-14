@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
+import anyio
 import hashlib
 import json
 import re
@@ -24,8 +24,10 @@ from dojoagents.attribution.base import AttributionFactor
 from dojoagents.config.loader import ConfigStore
 from dojoagents.dojo_sdk import close_async_dojo, create_async_dojo
 from dojoagents.dashboard.client.tasks import check_dashboard_health, dashboard_base_url_from_config
+from dojoagents.tools import processes
 from dojoagents.utils.trading_calendar import open_markets_on
 from dojoagents.logging import LOGGER, configure_logging
+from dojoagents.utils.async_runtime import gather_ordered
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _MARKETS = ("us", "cn", "hk")
@@ -177,34 +179,27 @@ def _local_dashboard_bind(base_url: str) -> tuple[str, int] | None:
 
 
 async def _wait_for_dashboard(
-    process: asyncio.subprocess.Process,
+    process: processes.Process,
     *,
     base_url: str,
     timeout: float,
 ) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
+    deadline = anyio.current_time() + timeout
+    while anyio.current_time() < deadline:
         if await check_dashboard_health(base_url):
             LOGGER.info("Runtime Dashboard is ready: %s", base_url)
             return
         if process.returncode is not None:
             raise RuntimeError(f"Runtime Dashboard exited during startup with code {process.returncode}")
-        await asyncio.sleep(0.5)
+        await anyio.sleep(0.5)
     raise TimeoutError(f"Runtime Dashboard did not become ready within {timeout:g}s: {base_url}")
 
 
-async def _stop_dashboard(process: asyncio.subprocess.Process) -> None:
+async def _stop_dashboard(process: processes.Process) -> None:
     if process.returncode is not None:
         return
     LOGGER.info("Stopping managed runtime Dashboard (pid=%s)", process.pid)
-    process.terminate()
-    try:
-        await asyncio.wait_for(process.wait(), timeout=30.0)
-    except asyncio.TimeoutError:
-        LOGGER.warning("Managed runtime Dashboard did not stop gracefully; killing pid=%s", process.pid)
-        process.kill()
-        await process.wait()
+    await processes.terminate_then_kill(process, grace_seconds=30.0)
 
 
 @asynccontextmanager
@@ -235,7 +230,13 @@ async def managed_dashboard_runtime(
         "--lightweight-runtime",
     ]
     LOGGER.info("Starting managed runtime Dashboard: %s", " ".join(command))
-    process = await asyncio.create_subprocess_exec(*command)
+    # 长驻进程：保留继承的 stdin/stdout/stderr，Dashboard 日志继续直接输出到当前终端
+    process = await processes.open_process(
+        command,
+        stdin=processes.INHERIT,
+        stdout=processes.INHERIT,
+        stderr=processes.INHERIT,
+    )
     try:
         await _wait_for_dashboard(
             process,
@@ -397,7 +398,7 @@ async def _run_one(
     trading_date: str,
     local: bool,
     config: str | None,
-    semaphore: asyncio.Semaphore,
+    semaphore: anyio.Semaphore,
     dry_run: bool,
 ) -> tuple[SectorJob, int]:
     command = _build_task_command(job, trading_date=trading_date, local=local, config=config)
@@ -405,10 +406,11 @@ async def _run_one(
         LOGGER.info("START %s %s | %s", job.market, job.name, " ".join(command))
         if dry_run:
             return job, 0
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+        process = await processes.open_process(
+            command,
+            stdin=processes.INHERIT,
+            stdout=processes.PIPE,
+            stderr=processes.STDOUT,
         )
         stdout, _ = await process.communicate()
         code = int(process.returncode or 0)
@@ -602,19 +604,18 @@ async def run_attribution_factor_crawl(args: argparse.Namespace) -> int:
                     len(pending_jobs),
                 )
             config_override = None if args.config == "~/.dojo/agents.yaml" else str(args.config)
-            semaphore = asyncio.Semaphore(int(args.concurrency))
-            results = await asyncio.gather(
-                *(
-                    _run_one(
+            semaphore = anyio.Semaphore(int(args.concurrency))
+            results = await gather_ordered(
+                [
+                    lambda job=job: _run_one(
                         job,
                         trading_date=trading_date,
                         local=bool(args.local),
                         config=config_override,
                         semaphore=semaphore,
                         dry_run=bool(args.dry_run),
-                    )
-                    for job in pending_jobs
-                )
+                    ) for job in pending_jobs
+                ]
             )
             if args.dry_run:
                 LOGGER.info(
@@ -667,7 +668,7 @@ async def run_attribution_factor_crawl(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
-        return asyncio.run(run_attribution_factor_crawl(args))
+        return anyio.run(run_attribution_factor_crawl, args)
     except KeyboardInterrupt:
         LOGGER.error("Interrupted")
         return 130

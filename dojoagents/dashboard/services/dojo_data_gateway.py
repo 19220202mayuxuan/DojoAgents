@@ -1,15 +1,17 @@
 from __future__ import annotations
-import asyncio
-import logging
-import json
+
 import inspect
+import json
+import logging
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
-import pandas as pd
+
 import httpx
+import pandas as pd
 
 from dojoagents.logging import LOGGER
 from dojoagents.dashboard.schemas.freshness import DataSource
+from dojoagents.utils.async_runtime import gather_ordered
 
 T = TypeVar("T")
 
@@ -185,7 +187,7 @@ class DojoDataGateway:
     async def _call(self, operation: str, awaitable: Any) -> Any:
         try:
             return await awaitable
-        except (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException) as exc:
+        except (TimeoutError, httpx.TimeoutException) as exc:
             raise GatewayTimeoutError(f"{operation}: upstream request timed out") from exc
         except (ConnectionError, httpx.NetworkError) as exc:
             raise GatewayUnavailableError(f"{operation}: upstream source is unavailable") from exc
@@ -306,14 +308,11 @@ class DojoDataGateway:
         return _df_result(frame, snapshot=normalized_snapshot)
 
     async def _fetch_kline_rows(self, symbols: list[str], kwargs: dict[str, Any]) -> list[dict[str, Any]]:
-        semaphore = asyncio.Semaphore(self.kline_max_concurrent)
-
         async def fetch_one(symbol: str) -> list[dict[str, Any]]:
-            async with semaphore:
-                payload = await self._call(
-                    "stock_klines",
-                    self.client.stocks.get_kline(symbol=symbol, **kwargs),
-                )
+            payload = await self._call(
+                "stock_klines",
+                self.client.stocks.get_kline(symbol=symbol, **kwargs),
+            )
             result = _list_result(payload, "stock_klines", "klines")
             if LOGGER.isEnabledFor(logging.DEBUG) and symbol in symbols[:3]:
                 sample = []
@@ -331,7 +330,11 @@ class DojoDataGateway:
                 )
             return result.data
 
-        results = await asyncio.gather(*(fetch_one(symbol) for symbol in symbols), return_exceptions=True)
+        results = await gather_ordered(
+            [lambda symbol=symbol: fetch_one(symbol) for symbol in symbols],
+            max_concurrency=self.kline_max_concurrent,
+            return_exceptions=True,
+        )
         rows: list[dict[str, Any]] = []
         failures = 0
         failure_sample = []

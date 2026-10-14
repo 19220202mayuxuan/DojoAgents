@@ -2,6 +2,7 @@ import json
 import math
 import re
 from urllib.parse import urlsplit, urlunsplit
+
 import httpx
 from typing import Any, Protocol, Callable
 from dojoagents.agent.context_length import ContextLengthExceededError, parse_context_length_error
@@ -17,7 +18,14 @@ def redact_provider_response(value: Any, secret: str = "") -> Any:
     if isinstance(value, float) and not math.isfinite(value):
         return "<non_finite>"
     if isinstance(value, dict):
-        return {key: ("<remote URL omitted>" if key in {"file_url", "transcription_url", "video_url"} else redact_provider_response(item, secret)) for key, item in value.items()}
+        return {
+            key: (
+                "<remote URL omitted>"
+                if key in {"file_url", "transcription_url", "video_url"}
+                else redact_provider_response(item, secret)
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [redact_provider_response(item, secret) for item in value]
     if isinstance(value, str):
@@ -36,7 +44,8 @@ def redact_provider_response(value: Any, secret: str = "") -> Any:
 
 class _BoundedResponseStream(httpx.AsyncByteStream):
     def __init__(self, stream: httpx.AsyncByteStream, limit: int):
-        self.stream, self.limit = stream, limit
+        self.stream = stream
+        self.limit = limit
 
     async def __aiter__(self):
         size = 0
@@ -208,7 +217,9 @@ class OpenAICompatibleProvider:
             raise ValueError("timeout must be finite and positive")
         if max_response_bytes is not None and (type(max_response_bytes) is not int or max_response_bytes <= 0):
             raise ValueError("max_response_bytes must be a positive integer")
-        self.max_retries, self.timeout, self.max_response_bytes = max_retries, timeout, max_response_bytes
+        self.max_retries = max_retries
+        self.timeout = timeout
+        self.max_response_bytes = max_response_bytes
 
     async def _raw_completion(self, client, create_kwargs) -> LLMResult:
         from openai import APIStatusError
@@ -220,7 +231,10 @@ class OpenAICompatibleProvider:
             response = exc.response
         text = response.content.decode("utf-8", errors="backslashreplace")
         try:
-            body = json.loads(text, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+            body = json.loads(
+                text,
+                parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+            )
         except (ValueError, RecursionError):
             body = {"_unparsed_response": text}
         body = redact_provider_response(body, self.api_key or "")
@@ -235,7 +249,10 @@ class OpenAICompatibleProvider:
         }
         if isinstance(body, dict) and isinstance(body.get("usage"), dict):
             metadata["usage"] = body["usage"]
-        return LLMResult(content=content if isinstance(content, str) else "", metadata=metadata)
+        return LLMResult(
+            content=content if isinstance(content, str) else "",
+            metadata=metadata,
+        )
 
     @staticmethod
     def _usage_dict(usage: Any) -> dict[str, int] | None:
@@ -278,17 +295,28 @@ class OpenAICompatibleProvider:
         if include_raw_response and stream:
             raise ValueError("Raw receipts require a non-streaming call")
         options = dict(request_options or {})
-        allowed = {"temperature", "max_completion_tokens", "max_tokens", "response_format", "extra_body"}
+        allowed = {
+            "temperature",
+            "max_completion_tokens",
+            "max_tokens",
+            "response_format",
+            "extra_body",
+        }
         if set(options) - allowed:
             raise ValueError("Unsupported chat request options")
-        extra_body = {**((metadata or {}).get("_dojo_extra_body") or {}), **(options.get("extra_body") or {})}
+        extra_body = {
+            **((metadata or {}).get("_dojo_extra_body") or {}),
+            **(options.get("extra_body") or {}),
+        }
         if set(extra_body) & {"model", "messages", "tools", "stream"}:
             raise ValueError("extra_body cannot override the chat request identity")
         if extra_body:
             options["extra_body"] = extra_body
         if "max_completion_tokens" in options:
-            # Older supported SDKs accept this newer API field through extra_body.
-            options["extra_body"] = {**extra_body, "max_completion_tokens": options.pop("max_completion_tokens")}
+            options["extra_body"] = {
+                **extra_body,
+                "max_completion_tokens": options.pop("max_completion_tokens"),
+            }
         if not self.api_key:
             return LLMResult(
                 content=("OpenAI-compatible provider is configured without an API key. " "Set the configured api_key_env before making live calls."),
@@ -324,7 +352,11 @@ class OpenAICompatibleProvider:
         )
 
         actual_model = model
-        is_model_router = self.name == "model-router" or "openrouter.ai" in str(self.base_url or "").lower() or "orcarouter.ai" in str(self.base_url or "").lower()
+        is_model_router = (
+            self.name == "model-router"
+            or "openrouter.ai" in str(self.base_url or "").lower()
+            or "orcarouter.ai" in str(self.base_url or "").lower()
+        )
         if is_model_router and self.author and not model.startswith(f"{self.author}/"):
             actual_model = f"{self.author}/{model}"
 

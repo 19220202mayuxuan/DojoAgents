@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import anyio
 import time
 import uuid
 from contextlib import contextmanager
@@ -405,17 +405,22 @@ class MeteredLLMProvider:
             )
         except BaseException as exc:
             if collector is not None:
-                await collector.record(
-                    provider=provider_name,
-                    model=model,
-                    metadata=None,
-                    messages=messages,
-                    content="",
-                    status=("cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"),
-                    started_at=started_at,
-                    estimate_missing=False,
-                    pending=pending,
-                )
+                # Cancellation metadata is part of the durable usage ledger.
+                # Shield only this bounded write so the provider operation
+                # itself remains promptly cancellable.
+                with anyio.CancelScope(shield=True):
+                    with anyio.move_on_after(2):
+                        await collector.record(
+                            provider=provider_name,
+                            model=model,
+                            metadata=None,
+                            messages=messages,
+                            content="",
+                            status=("cancelled" if isinstance(exc, anyio.get_cancelled_exc_class()) else "failed"),
+                            started_at=started_at,
+                            estimate_missing=False,
+                            pending=pending,
+                        )
             raise
         if collector is not None:
             await collector.record(
