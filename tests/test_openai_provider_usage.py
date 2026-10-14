@@ -40,7 +40,8 @@ async def test_raw_receipt_preserves_finish_reason_usage_and_http_errors_without
         payload = json.loads(request.content)
         assert payload["enable_thinking"] is False
         assert payload["response_format"] == {"type": "json_object"}
-        assert payload["max_completion_tokens"] == 4096 and payload["temperature"] == 0.1
+        assert payload["max_completion_tokens"] == 4096
+        assert payload["temperature"] == 0.1
         assert payload["messages"][0]["content"][0]["type"] == "video_url"
         return httpx.Response(status, json=body)
 
@@ -51,20 +52,42 @@ async def test_raw_receipt_preserves_finish_reason_usage_and_http_errors_without
             super().__init__(transport=httpx.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", MockClient)
-    provider = OpenAICompatibleProvider(api_key="secret-key", base_url="https://example/v1", max_retries=0, timeout=3, max_response_bytes=4096)
+    provider = OpenAICompatibleProvider(
+        api_key="secret-key",
+        base_url="https://example/v1",
+        max_retries=0,
+        timeout=3,
+        max_response_bytes=4096,
+    )
     result = await provider.chat(
-        [{"role": "user", "content": [{"type": "video_url", "video_url": {"url": "https://bucket/video?X-Amz-Signature=secret-signature"}}]}],
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": "https://bucket/video?X-Amz-Signature=secret-signature"},
+                    }
+                ],
+            }
+        ],
         [],
         model="qwen",
         include_raw_response=True,
-        request_options={"temperature": 0.1, "max_completion_tokens": 4096, "response_format": {"type": "json_object"}, "extra_body": {"enable_thinking": False}},
+        request_options={
+            "temperature": 0.1,
+            "max_completion_tokens": 4096,
+            "response_format": {"type": "json_object"},
+            "extra_body": {"enable_thinking": False},
+        },
     )
     assert len(requests) == 1
     assert result.metadata["raw_response"]["http_status"] == status
     raw = result.metadata["raw_response"]["response"]
     assert raw["choices"][0]["finish_reason"] == "length"
-    assert raw["usage"] == body["usage"]  # Missing facts stay missing, rather than becoming zero.
-    assert "secret-key" not in json.dumps(raw) and "secret-signature" not in json.dumps(raw)
+    assert raw["usage"] == body["usage"]
+    assert "secret-key" not in json.dumps(raw)
+    assert "secret-signature" not in json.dumps(raw)
 
 
 @pytest.mark.asyncio
@@ -96,7 +119,12 @@ async def test_raw_transport_keeps_invalid_receipts_and_bounds_unknown_failures(
             super().__init__(transport=httpx.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", MockClient)
-    provider = OpenAICompatibleProvider(api_key="key", base_url="https://example/v1", max_retries=0, max_response_bytes=100)
+    provider = OpenAICompatibleProvider(
+        api_key="key",
+        base_url="https://example/v1",
+        max_retries=0,
+        max_response_bytes=100,
+    )
     if mode == "invalid_json":
         result = await provider.chat([], [], model="qwen", include_raw_response=True)
         assert result.metadata["raw_response"]["response"] == {"_unparsed_response": "{bad-json"}

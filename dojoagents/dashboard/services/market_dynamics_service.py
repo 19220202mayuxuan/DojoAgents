@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
+import anyio
 import json
 import math
 import time
@@ -24,7 +24,7 @@ from dojoagents.logging import LOGGER
 _events_cache: list[MarketDynamicsEvent] | None = None
 _events_cache_key: int | None = None
 _events_cache_expires_at: float = 0.0
-_events_cache_lock = asyncio.Lock()
+_events_cache_lock = anyio.Lock()
 _SDK_FETCH_LIMIT = 10000
 
 

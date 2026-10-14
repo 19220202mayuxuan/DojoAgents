@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+import anyio
 import time
 from typing import Any
 from dojoagents.agent.models import ToolCall, ToolResult, ToolResultList
@@ -18,6 +18,7 @@ from dojoagents.tools.registry import ToolRegistry
 from dojoagents.tools.sandbox import SandboxPolicy
 from dojoagents.tools.terminal_tool import truncate_output
 from dojoagents.logging import LOGGER
+from dojoagents.utils.async_runtime import SyncWorkload, gather_ordered, run_sync_bounded
 
 _MAX_TOOL_RESULT_CHARS = 30000
 
@@ -45,8 +46,9 @@ class ToolExecutor:
         if not tool_calls:
             return results
 
-        tasks = [self.execute_one(call, session_id=session_id) for call in tool_calls]
-        executed_results = await asyncio.gather(*tasks)
+        executed_results = await gather_ordered(
+            [lambda call=call: self.execute_one(call, session_id=session_id) for call in tool_calls]
+        )
         for res in executed_results:
             results.append(res)
         return results
@@ -70,10 +72,8 @@ class ToolExecutor:
         started_at = time.perf_counter()
         try:
             self.sandbox.check_tool(call.name)
-            raw = await asyncio.wait_for(
-                spec.handler(dict(call.arguments)),
-                timeout=self.sandbox.timeout_seconds,
-            )
+            with anyio.fail_after(self.sandbox.timeout_seconds):
+                raw = await spec.handler(dict(call.arguments))
             latency_ms = int((time.perf_counter() - started_at) * 1000)
             return await self._coerce_result(call, raw, session_id=session_id, latency_ms=latency_ms)
         except AgentEscalationError as exc:
@@ -91,6 +91,33 @@ class ToolExecutor:
                 latency_ms=int((time.perf_counter() - started_at) * 1000),
                 metadata=escalation_metadata(exc, source_tool=call.name),
             )
+        except TimeoutError:
+            timeout_seconds = self.sandbox.timeout_seconds
+            LOGGER.warning(
+                "Tool '%s' timed out after %ss (call_id: %s)",
+                call.name,
+                timeout_seconds,
+                call.id,
+            )
+            return ToolResult(
+                call_id=call.id,
+                name=call.name,
+                ok=False,
+                error=f"Tool '{call.name}' timed out after {timeout_seconds:g} seconds",
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+            )
+        except BaseExceptionGroup as exc:
+            cancelled, remainder = exc.split(anyio.get_cancelled_exc_class())
+            if cancelled is not None:
+                raise cancelled
+            LOGGER.exception("Grouped error executing tool '%s' (call_id: %s)", call.name, call.id)
+            return ToolResult(
+                call_id=call.id,
+                name=call.name,
+                ok=False,
+                error=str(remainder or exc),
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+            )
         except Exception as exc:
             LOGGER.exception(f"Error executing tool '{call.name}' (call_id: {call.id})")
             return ToolResult(
@@ -98,6 +125,7 @@ class ToolExecutor:
                 name=call.name,
                 ok=False,
                 error=str(exc),
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
             )
         finally:
             active_session_id.reset(token)
@@ -153,32 +181,34 @@ class ToolExecutor:
                 if not error:
                     error = content.strip() or f"Process exited with code {exit_code_int}"
 
-        persist_artifact = self.artifact_store is not None and bool(session_id) and len(original_content) >= ARTIFACT_PERSIST_THRESHOLD_CHARS
+        persist_artifact = (
+            self.artifact_store is not None
+            and bool(session_id)
+            and len(original_content) >= ARTIFACT_PERSIST_THRESHOLD_CHARS
+        )
         if persist_artifact:
             try:
                 artifact_data = normalized.get("data")
                 if self.artifact_adapter is not None:
-                    artifact_data = await asyncio.to_thread(self.artifact_adapter.extract_data, call.name, original_content, artifact_data)
-                save_task = asyncio.create_task(
-                    asyncio.to_thread(
-                        self.artifact_store.save,
-                        session_id=session_id,
-                        call_id=call.id,
-                        tool_name=call.name,
-                        arguments=dict(call.arguments),
-                        content=original_content,
-                        data=artifact_data,
-                        ok=ok,
-                        truncated=source_truncated,
-                        error=error,
+                    artifact_data = await run_sync_bounded(
+                        self.artifact_adapter.extract_data,
+                        call.name,
+                        original_content,
+                        artifact_data,
+                        workload=SyncWorkload.CPU,
                     )
+                artifact_path = await run_sync_bounded(
+                    self.artifact_store.save,
+                    session_id=session_id,
+                    call_id=call.id,
+                    tool_name=call.name,
+                    arguments=dict(call.arguments),
+                    content=original_content,
+                    data=artifact_data,
+                    ok=ok,
+                    truncated=source_truncated,
+                    error=error,
                 )
-                try:
-                    artifact_path = await asyncio.shield(save_task)
-                except asyncio.CancelledError:
-                    # Finish the write before a cancelled Run allows session cleanup.
-                    await save_task
-                    raise
             except FileStoreSizeError:
                 raise
             except Exception:
@@ -187,17 +217,23 @@ class ToolExecutor:
                 metadata["artifact_path"] = str(artifact_path)
                 metadata["artifact_call_id"] = call.id
                 if ok and call.name in self.pointer_tools and call.name not in ARTIFACT_KEEP_FULL_CONTENT_TOOLS:
-                    source = await asyncio.to_thread(structured_artifact_data, artifact_data, original_content)
+                    source = await run_sync_bounded(
+                        structured_artifact_data,
+                        artifact_data,
+                        original_content,
+                        workload=SyncWorkload.CPU,
+                    )
                     if source is not None:
                         try:
                             pointer_builder = self.artifact_adapter.build_pointer if self.artifact_adapter is not None else build_artifact_pointer_message
-                            content = await asyncio.to_thread(
+                            content = await run_sync_bounded(
                                 pointer_builder,
                                 tool_name=call.name,
                                 call_id=call.id,
                                 arguments=dict(call.arguments),
                                 data=source,
                                 content=original_content,
+                                workload=SyncWorkload.CPU,
                             )
                             normalized["truncated"] = source_truncated
                         except Exception:

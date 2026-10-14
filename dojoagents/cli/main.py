@@ -4,7 +4,7 @@ from pathlib import Path
 from dojoagents.logging import LOGGER
 
 import argparse
-import asyncio
+import anyio
 from types import FrameType
 from typing import Callable
 
@@ -179,7 +179,7 @@ def _run_sessions(args: argparse.Namespace) -> int:
         for file in result.files:
             LOGGER.info(" - %s", file)
         return 0
-    return asyncio.run(_run_canonical_sessions(args))
+    return anyio.run(_run_canonical_sessions, args)
 
 
 async def _run_canonical_sessions(args: argparse.Namespace) -> int:
@@ -234,7 +234,7 @@ def main(argv: list[str] | None = None) -> int:
             return int(exc.code)
         raise
     if args.command == "chat":
-        return asyncio.run(_run_chat(args))
+        return anyio.run(_run_chat, args)
     if args.command == "dashboard":
         from dataclasses import replace
 
@@ -334,18 +334,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "precompute-sector":
         from dojoagents.dashboard.cli.precompute_sector import run_precompute_sector
 
-        return asyncio.run(run_precompute_sector(args))
+        return anyio.run(run_precompute_sector, args)
     if args.command == "precompute-sector-theme-state":
         from dojoagents.dashboard.cli.precompute_theme_state import (
             run_precompute_sector_theme_state,
         )
 
-        return asyncio.run(run_precompute_sector_theme_state(args))
+        return anyio.run(run_precompute_sector_theme_state, args)
     if args.command == "attribution-factor-crawl":
         from dojoagents.dashboard.cli.attribution_factor_crawl import run_attribution_factor_crawl
 
         try:
-            return asyncio.run(run_attribution_factor_crawl(args))
+            return anyio.run(run_attribution_factor_crawl, args)
         except Exception as exc:
             LOGGER.exception("attribution-factor-crawl failed: %s", exc)
             return 1
@@ -353,14 +353,14 @@ def main(argv: list[str] | None = None) -> int:
         from dojoagents.dashboard.cli.sector_brief_extract import run_sector_brief_extract
 
         try:
-            return asyncio.run(run_sector_brief_extract(args))
+            return anyio.run(run_sector_brief_extract, args)
         except Exception as exc:
             LOGGER.exception("sector-brief-extract failed: %s", exc)
             return 1
     if args.command == "tasks":
         from dojoagents.dashboard.cli.tasks import run_tasks_command
 
-        return asyncio.run(run_tasks_command(args))
+        return anyio.run(run_tasks_command, args)
     return 2
 
 

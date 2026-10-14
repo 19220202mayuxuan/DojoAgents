@@ -344,7 +344,9 @@ async def test_web_search_serply_rejected_key_returns_error(monkeypatch):
     monkeypatch.setattr(web_searcher, "_make_async_client", fake_client_factory)
 
     executor = _make_executor({"tools": {"web": {"search_backend": "serply", "api_key": "bad-key"}}})
-    result = await executor.execute_one(ToolCall(id="call-1", name="web_search", arguments={"query": "dojo"}))
+    result = await executor.execute_one(
+        ToolCall(id="call-1", name="web_search", arguments={"query": "dojo"})
+    )
 
     assert result.ok is False
     assert "401" in result.error
@@ -353,7 +355,9 @@ async def test_web_search_serply_rejected_key_returns_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_web_search_serply_without_api_key_returns_error():
     executor = _make_executor({"tools": {"web": {"search_backend": "serply"}}})
-    result = await executor.execute_one(ToolCall(id="call-1", name="web_search", arguments={"query": "dojo"}))
+    result = await executor.execute_one(
+        ToolCall(id="call-1", name="web_search", arguments={"query": "dojo"})
+    )
 
     assert result.ok is False
     assert "api key" in result.error.lower()

@@ -1,4 +1,4 @@
-import asyncio
+import anyio
 import datetime
 import inspect
 import traceback
@@ -10,6 +10,7 @@ from dojoagents.dashboard.services.constituent_kline_refresh_state import (
     RefreshStateStore,
 )
 from dojoagents.logging import LOGGER
+from dojoagents.utils.async_runtime import SyncWorkload, run_sync_bounded
 
 
 async def start_refresh_loop(
@@ -21,6 +22,7 @@ async def start_refresh_loop(
     paths: tuple[str, ...] | list[str] = (),
     repos: tuple[str, ...] | list[str] = (),
     hot_paths: tuple[str, ...] | list[str] = (),
+    task_status: anyio.abc.TaskStatus[None] = anyio.TASK_STATUS_IGNORED,
 ):
     """Refresh hot snapshots on each poll and the full scope once per market date.
 
@@ -47,6 +49,8 @@ async def start_refresh_loop(
         selected_repos,
         selected_hot_paths,
     )
+    task_status.started()
+    cancelled_exc = anyio.get_cancelled_exc_class()
     while True:
         try:
             now = datetime.datetime.now()
@@ -76,7 +80,7 @@ async def start_refresh_loop(
                 if inspect.iscoroutinefunction(sync):
                     result = await sync(**kwargs)
                 else:
-                    result = await asyncio.to_thread(sync, **kwargs)
+                    result = await run_sync_bounded(sync, workload=SyncWorkload.SDK_IO, **kwargs)
                 failures = tuple(getattr(result, "failures", ()) or ())
                 updated_repos = tuple(getattr(result, "updated_repos", ()) or ())
                 changed = bool(getattr(result, "changed", False))
@@ -85,7 +89,11 @@ async def start_refresh_loop(
                     if inspect.iscoroutinefunction(refresh):
                         await refresh(updated_repos=updated_repos)
                     else:
-                        await asyncio.to_thread(refresh, updated_repos=updated_repos)
+                        await run_sync_bounded(
+                            refresh,
+                            updated_repos=updated_repos,
+                            workload=SyncWorkload.SDK_IO,
+                        )
                 if failures:
                     LOGGER.warning(
                         "%s snapshot sync had %d failed repositories; it will be retried",
@@ -94,11 +102,11 @@ async def start_refresh_loop(
                     )
                 elif daily_sync_due:
                     await refresh_store.set_last_refresh_date_async(SNAPSHOT_REFRESH_STATE_KEY, target_date)
-            await asyncio.sleep(poll_interval)
+            await anyio.sleep(poll_interval)
 
-        except asyncio.CancelledError:
+        except cancelled_exc:
             LOGGER.debug("Market refresh loop cancelled.")
-            break
+            raise
         except Exception as e:
             LOGGER.error(f"Unexpected error in refresh loop: {e}\n{traceback.format_exc()}")
-            await asyncio.sleep(60)  # Sleep shortly on unexpected error
+            await anyio.sleep(60)  # Sleep shortly on unexpected error

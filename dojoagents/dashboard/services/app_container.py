@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
+import anyio
 import datetime
 import inspect
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +21,7 @@ from dojoagents.dashboard.services.financial_registry import FinancialDomainRegi
 from dojoagents.dashboard.services.market_refresh_jobs import start_refresh_loop
 from dojoagents.config.models import AgentsConfig, DEFAULT_DOJOSDK_STARTUP_PATHS
 from dojoagents.logging import LOGGER
+from dojoagents.utils.async_runtime import SyncWorkload, run_sync_bounded
 
 
 HOT_SNAPSHOT_PATHS = (
@@ -112,12 +114,15 @@ class DashboardAppServices:
         self.portfolio_store: Any | None = None
         self.portfolio_service: Any | None = None
         self.refresh_store = RefreshStateStore(config.data_root / "runtime")
-        self.refresh_task: asyncio.Task[Any] | None = None
+        self._refresh_running = False
         self.market_data_revision: dict[str, Any] = {}
         self._ready = False
         self._stopped = False
-        self._startup_task: asyncio.Task[Any] | None = None
-        self._startup_loop: asyncio.AbstractEventLoop | None = None
+        # A portal bound to the startup loop so a *foreign* thread can ask for
+        # cancellation without touching the loop from outside it.
+        self._portal: anyio.from_thread.BlockingPortal | None = None
+        self._portal_thread_ident: int | None = None
+        self._startup_scope: anyio.CancelScope | None = None
 
     def replace_factories_for_testing(
         self,
@@ -135,19 +140,50 @@ class DashboardAppServices:
         if refresh_loop is not None:
             self._refresh_loop = refresh_loop
 
-    async def startup(self) -> None:
+    async def startup(self, *, task_group: anyio.abc.TaskGroup | None = None) -> None:
+        """Start Dashboard financial services, cancellable from a signal thread.
+
+        The portal is owned by this component for exactly the duration of the
+        startup call: it is entered here, closed in this same task's ``finally``,
+        and never created per request.
+        """
+
         if self._ready:
             return
-        self._startup_task = asyncio.current_task()
-        self._startup_loop = asyncio.get_running_loop()
+        portal = anyio.from_thread.BlockingPortal()
+        await portal.__aenter__()
+        self._portal = portal
+        # The portal is created on the startup loop, so this is that loop's thread.
+        self._portal_thread_ident = threading.get_ident()
         self._stopped = False
         try:
-            LOGGER.info(
-                "Starting Dashboard financial services: data_mode=%s ensure_offline_snapshots=%s refresh_enabled=%s",
-                "offline" if self.config.offline_mode else "online",
-                self.config.ensure_offline_snapshots,
-                self.config.refresh_enabled,
-            )
+            with anyio.CancelScope() as scope:
+                self._startup_scope = scope
+                await self._startup_services(task_group=task_group)
+            if scope.cancelled_caught:
+                # ``cancel_startup`` fired while startup was in flight.  The cancel
+                # scope would otherwise swallow the cancellation, but the Dashboard
+                # lifespan shutdown path depends on observing it.
+                raise anyio.get_cancelled_exc_class()()
+        finally:
+            self._startup_scope = None
+            self._portal = None
+            self._portal_thread_ident = None
+            # Exited at the same depth it was entered: AnyIO only allows a cancel
+            # scope to be closed while it is the task's current scope, so this must
+            # not be wrapped in a shield (``BlockingPortal.__aexit__`` closes a
+            # task group).  ``__aexit__`` itself performs no cancellable await when
+            # the portal has no child tasks, which is always the case here.
+            await portal.__aexit__(None, None, None)
+
+    async def _startup_services(self, *, task_group: anyio.abc.TaskGroup | None = None) -> None:
+        LOGGER.info(
+            "Starting Dashboard financial services: data_mode=%s ensure_offline_snapshots=%s refresh_enabled=%s",
+            "offline" if self.config.offline_mode else "online",
+            self.config.ensure_offline_snapshots,
+            self.config.refresh_enabled,
+        )
+        try:
             self.client = self._client_factory(**dojo_client_kwargs(
                 api_key=self.config.api_key,
                 base_url=self.config.base_url,
@@ -193,7 +229,7 @@ class DashboardAppServices:
                     if inspect.iscoroutinefunction(ensure):
                         await ensure(**kwargs)
                     else:
-                        await asyncio.to_thread(ensure, **kwargs)
+                        await run_sync_bounded(ensure, workload=SyncWorkload.SDK_IO, **kwargs)
                 # ``ensure`` deliberately reuses an existing active snapshot. A
                 # bounded remote revision check is therefore required at startup
                 # to preserve the old local-SDK behaviour of seeing newly
@@ -208,7 +244,11 @@ class DashboardAppServices:
                     if inspect.iscoroutinefunction(sync):
                         startup_sync_result = await sync(**sync_kwargs)
                     else:
-                        startup_sync_result = await asyncio.to_thread(sync, **sync_kwargs)
+                        startup_sync_result = await run_sync_bounded(
+                            sync,
+                            workload=SyncWorkload.SDK_IO,
+                            **sync_kwargs,
+                        )
                     failures = tuple(getattr(startup_sync_result, "failures", ()) or ())
                     if failures:
                         LOGGER.warning(
@@ -236,39 +276,46 @@ class DashboardAppServices:
             self.portfolio_service = getattr(self.registry, "portfolio_service", None)
             self.market_data_revision = self.refresh_store.get_market_data_revision()
             if self.config.refresh_enabled:
-                self.refresh_task = asyncio.create_task(
-                    self._refresh_loop(
-                        runtime_dir=self.config.data_root / "runtime",
-                        registry=self.registry,
-                        poll_interval=self.config.refresh_poll_seconds,
-                        paths=self.config.startup_paths,
-                        repos=self.config.startup_repos,
-                        hot_paths=HOT_SNAPSHOT_PATHS,
-                    ),
-                    name="financial-market-refresh",
-                )
+                if task_group is None:
+                    raise RuntimeError("refresh-enabled Dashboard services require a parent TaskGroup")
+                await task_group.start(self._run_refresh_service)
             self._ready = True
         except BaseException:
-            try:
-                await self.shutdown()
-            except Exception:
-                LOGGER.exception("Failed to clean up interrupted Dashboard financial startup")
+            # Shielded: this path runs while a cancellation is already pending, and
+            # an unshielded await would abort before the clients are released.
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.shutdown()
+                except Exception:
+                    LOGGER.exception("Failed to clean up interrupted Dashboard financial startup")
             raise
-        finally:
-            self._startup_task = None
-            self._startup_loop = None
 
     def cancel_startup(self) -> None:
-        """Cancel startup safely when the CLI receives Ctrl+C."""
-        task = self._startup_task
-        loop = self._startup_loop
-        if task is not None and not task.done() and loop is not None:
-            loop.call_soon_threadsafe(task.cancel)
+        """Cancel startup safely when the CLI receives Ctrl+C.
+
+        Uvicorn's ``add_signal_handler`` callbacks run *on the startup loop's own
+        thread*, while a plain OS signal handler runs elsewhere.  Both paths must
+        work, so the cancellation is delivered directly when it is already on the
+        right loop and through the component's portal when it is not — the portal
+        would otherwise refuse to re-enter its own loop.
+        """
+
+        scope = self._startup_scope
+        if scope is None:
+            return
+        portal = self._portal
+        if portal is not None and threading.get_ident() != self._portal_thread_ident:
+            try:
+                portal.call(scope.cancel)
+                return
+            except RuntimeError:
+                LOGGER.debug("Dashboard startup cancel signal could not reach the startup portal")
+        scope.cancel()
 
     async def health(self) -> DashboardServiceHealth:
         client_ready = self.client is not None
         registry_ready = self.registry is not None and getattr(self.registry, "client", None) is self.client
-        refresh_running = self.refresh_task is not None and not self.refresh_task.done()
+        refresh_running = self._refresh_running
         healthy = self._ready and client_ready and registry_ready
         return DashboardServiceHealth(
             healthy=healthy,
@@ -296,7 +343,7 @@ class DashboardAppServices:
         if inspect.iscoroutinefunction(sync):
             result = await sync(**kwargs)
         else:
-            result = await asyncio.to_thread(sync, **kwargs)
+            result = await run_sync_bounded(sync, workload=SyncWorkload.SDK_IO, **kwargs)
         failures = tuple(getattr(result, "failures", ()) or ())
         updated_repos = tuple(getattr(result, "updated_repos", ()) or ())
         if bool(getattr(result, "changed", False)) and updated_repos:
@@ -305,7 +352,11 @@ class DashboardAppServices:
                 if inspect.iscoroutinefunction(callback):
                     await callback(updated_repos=updated_repos)
                 else:
-                    await asyncio.to_thread(callback, updated_repos=updated_repos)
+                    await run_sync_bounded(
+                        callback,
+                        updated_repos=updated_repos,
+                        workload=SyncWorkload.SDK_IO,
+                    )
         if failures:
             LOGGER.warning(
                 "Manual snapshot refresh had %d failed repositories; successful repositories remain committed",
@@ -324,17 +375,6 @@ class DashboardAppServices:
         self._stopped = True
         self._ready = False
         errors: list[str] = []
-        if self.refresh_task is not None:
-            self.refresh_task.cancel()
-            try:
-                await self.refresh_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as exc:
-                errors.append(f"refresh task: {exc}")
-            finally:
-                self.refresh_task = None
-
         clients = [client for client in (self.live_client, self.client) if client is not None]
         unique_clients = list(dict.fromkeys(map(id, clients)))
         clients_by_id = {id(client): client for client in clients}
@@ -366,6 +406,31 @@ class DashboardAppServices:
         self.registry = None
         if errors:
             raise RuntimeError("financial service shutdown failed: " + "; ".join(errors))
+
+    async def _run_refresh_service(
+        self,
+        *,
+        task_status: anyio.abc.TaskStatus[None] = anyio.TASK_STATUS_IGNORED,
+    ) -> None:
+        """Run refresh work inside the Dashboard lifespan's TaskGroup."""
+
+        self._refresh_running = True
+        kwargs = {
+            "runtime_dir": self.config.data_root / "runtime",
+            "registry": self.registry,
+            "poll_interval": self.config.refresh_poll_seconds,
+            "paths": self.config.startup_paths,
+            "repos": self.config.startup_repos,
+            "hot_paths": HOT_SNAPSHOT_PATHS,
+        }
+        try:
+            if "task_status" in inspect.signature(self._refresh_loop).parameters:
+                await self._refresh_loop(**kwargs, task_status=task_status)
+            else:
+                task_status.started()
+                await self._refresh_loop(**kwargs)
+        finally:
+            self._refresh_running = False
 
 
 __all__ = [

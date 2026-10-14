@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dojoagents.logging import LOGGER
 
-import asyncio
+import anyio
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +13,7 @@ from dojoagents.dashboard.schemas.market import MarketStats
 from dojoagents.dashboard.schemas.stock import Stock, StockQuote
 from dojoagents.dashboard.services.dojo_data_gateway import DojoDataGateway
 from dojoagents.dashboard.services.domain_utils import normalize_market_code
+from dojoagents.utils.async_runtime import gather_ordered
 
 MARKETS = ("sh", "hk", "us")
 
@@ -73,7 +74,7 @@ async def fetch_quotes_by_market(
         except Exception as e:
             LOGGER.error(f"[StockStore] batch fetch error for {market}: {e}")
 
-    await asyncio.gather(*(fetch_batch(b) for b in batches))
+    await gather_ordered([lambda batch=batch: fetch_batch(batch) for batch in batches])
     return quote_map
 
 
@@ -156,7 +157,7 @@ class StockStore:
         self.quote_as_of: Optional[str] = None
         self.quote_source: str = "sdk_snapshot"
         self.quote_stale: bool = False
-        self._quote_refresh_lock = asyncio.Lock()
+        self._quote_refresh_lock = anyio.Lock()
 
     @staticmethod
     def _key(market: str, ticker: str) -> str:

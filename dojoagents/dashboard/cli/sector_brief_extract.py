@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
+import anyio
 import hashlib
 import json
 import re
@@ -24,11 +24,13 @@ from dojoagents.dashboard.cli.attribution_factor_crawl import (
     managed_dashboard_runtime,
 )
 from dojoagents.dashboard.client.tasks import dashboard_base_url_from_config
+from dojoagents.tools import processes
 from dojoagents.dashboard.services.attribution_factor_service import (
     _calendar_day,
     _unwrap_payload,
     canonical_attribution_sector_ref,
 )
+from dojoagents.utils.async_runtime import gather_ordered
 from dojoagents.utils.trading_calendar import open_markets_on
 from dojoagents.logging import LOGGER, configure_logging
 from dojoagents.tasks.schema_validator import validate_json_payload
@@ -271,7 +273,7 @@ async def _run_one(
     model: str | None,
     output_path: Path,
     max_attempts: int,
-    semaphore: asyncio.Semaphore,
+    semaphore: anyio.Semaphore,
     dry_run: bool,
 ) -> tuple[BriefJob, int]:
     command = _build_task_command(
@@ -295,10 +297,11 @@ async def _run_one(
                 max_attempts,
                 " ".join(command),
             )
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
+            process = await processes.open_process(
+                command,
+                stdin=processes.INHERIT,
+                stdout=processes.PIPE,
+                stderr=processes.STDOUT,
             )
             stdout, _ = await process.communicate()
             process_code = int(process.returncode or 0)
@@ -492,10 +495,10 @@ async def run_sector_brief_extract(args: argparse.Namespace) -> int:
                 config_path=str(args.config),
                 startup_timeout=float(args.dashboard_startup_timeout),
             ):
-                semaphore = asyncio.Semaphore(int(args.concurrency))
-                results = await asyncio.gather(
-                    *(
-                        _run_one(
+                semaphore = anyio.Semaphore(int(args.concurrency))
+                results = await gather_ordered(
+                    [
+                        lambda job=job: _run_one(
                             job,
                             as_of_date=as_of_date,
                             lookback_days=int(args.lookback_days),
@@ -506,9 +509,8 @@ async def run_sector_brief_extract(args: argparse.Namespace) -> int:
                             max_attempts=int(args.max_attempts),
                             semaphore=semaphore,
                             dry_run=bool(args.dry_run),
-                        )
-                        for job in pending
-                    )
+                        ) for job in pending
+                    ]
                 )
         if args.dry_run:
             LOGGER.info("Dry run complete: run=%d skipped=%d", len(results), len(reused))
@@ -554,7 +556,7 @@ async def run_sector_brief_extract(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        return asyncio.run(run_sector_brief_extract(build_parser().parse_args(argv)))
+        return anyio.run(run_sector_brief_extract, build_parser().parse_args(argv))
     except KeyboardInterrupt:
         LOGGER.error("Interrupted")
         return 130
