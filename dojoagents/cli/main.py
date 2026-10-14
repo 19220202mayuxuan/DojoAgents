@@ -130,11 +130,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 async def _run_chat(args: argparse.Namespace) -> int:
     runtime = Runtime.from_default_config()
-    quant = None
+    request_context: dict[str, object] = {}
     if args.market and args.symbols:
-        quant = {
+        request_context["financial"] = {
             "market": args.market,
-            "symbols": [symbol.strip() for symbol in args.symbols.split(",") if symbol.strip()],
+            "symbols": [
+                symbol.strip()
+                for symbol in args.symbols.split(",")
+                if symbol.strip()
+            ],
             "timeframe": args.timeframe,
         }
     response = await runtime.agent.run(
@@ -142,7 +146,7 @@ async def _run_chat(args: argparse.Namespace) -> int:
             principal=SessionPrincipal("local"),
             session_id="cli",
             message=args.message or input("> "),
-            quant=quant,
+            context=request_context,
         )
     )
     LOGGER.info(response.content)
