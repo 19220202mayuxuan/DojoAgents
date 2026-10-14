@@ -18,14 +18,7 @@ def redact_provider_response(value: Any, secret: str = "") -> Any:
     if isinstance(value, float) and not math.isfinite(value):
         return "<non_finite>"
     if isinstance(value, dict):
-        return {
-            key: (
-                "<remote URL omitted>"
-                if key in {"file_url", "transcription_url", "video_url"}
-                else redact_provider_response(item, secret)
-            )
-            for key, item in value.items()
-        }
+        return {key: ("<remote URL omitted>" if key in {"file_url", "transcription_url", "video_url"} else redact_provider_response(item, secret)) for key, item in value.items()}
     if isinstance(value, list):
         return [redact_provider_response(item, secret) for item in value]
     if isinstance(value, str):
@@ -352,11 +345,7 @@ class OpenAICompatibleProvider:
         )
 
         actual_model = model
-        is_model_router = (
-            self.name == "model-router"
-            or "openrouter.ai" in str(self.base_url or "").lower()
-            or "orcarouter.ai" in str(self.base_url or "").lower()
-        )
+        is_model_router = self.name == "model-router" or "openrouter.ai" in str(self.base_url or "").lower() or "orcarouter.ai" in str(self.base_url or "").lower()
         if is_model_router and self.author and not model.startswith(f"{self.author}/"):
             actual_model = f"{self.author}/{model}"
 
@@ -417,6 +406,8 @@ class OpenAICompatibleProvider:
                     continue
                 choice = chunk.choices[0]
                 delta = choice.delta
+                if event_sink is not None:
+                    await event_sink.wait_for_capacity()
                 reasoning_delta = getattr(delta, "reasoning_content", None) or (
                     delta.model_extra.get("reasoning_content") if hasattr(delta, "model_extra") and delta.model_extra else None
                 )
@@ -449,6 +440,7 @@ class OpenAICompatibleProvider:
                         tool_calls_buffer[idx]["metadata"].update(_extract_tool_call_metadata(tc_delta, self.name))
 
             if event_sink is not None and reasoning_started and not reasoning_ended:
+                await event_sink.wait_for_capacity()
                 event_sink.thinking_end()
                 reasoning_ended = True
             final_tool_calls = []
