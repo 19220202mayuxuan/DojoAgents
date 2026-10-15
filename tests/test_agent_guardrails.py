@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dojoagents.agent.guardrails import (
     ToolCallGuardrailController,
+    ToolGuardrailAction,
     ToolGuardrailDecision,
     append_toolguard_guidance,
     toolguard_synthetic_result,
@@ -11,16 +12,21 @@ from dojoagents.agent.guardrails import (
 
 def test_guardrail_action_state_matrix() -> None:
     expected = {
-        "allow": (True, False),
-        "warn": (True, False),
-        "block": (False, False),
-        "halt": (False, True),
+        ToolGuardrailAction.ALLOW: (True, False),
+        ToolGuardrailAction.WARN: (True, False),
+        ToolGuardrailAction.BLOCK: (False, False),
+        ToolGuardrailAction.HALT: (False, True),
     }
 
     for action, (allows_execution, should_halt) in expected.items():
         decision = ToolGuardrailDecision(action=action)
         assert decision.allows_execution is allows_execution
         assert decision.should_halt is should_halt
+        payload = json.loads(json.dumps(toolguard_synthetic_result(decision)))
+        assert payload["metadata"]["stopped"] == action.value
+        assert json.loads(payload["content"])["guardrail"]["action"] == action.value
+
+    assert ToolGuardrailDecision().action is ToolGuardrailAction.ALLOW
 
 
 def test_guardrails_failures():

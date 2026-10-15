@@ -3,10 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping
+from enum import StrEnum
+from typing import Any, Mapping
 
 
-ToolGuardrailAction = Literal["allow", "warn", "block", "halt"]
+class ToolGuardrailAction(StrEnum):
+    ALLOW = "allow"
+    WARN = "warn"
+    BLOCK = "block"
+    HALT = "halt"
+
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
     {
@@ -50,7 +56,7 @@ class ToolCallSignature:
 
 @dataclass(frozen=True)
 class ToolGuardrailDecision:
-    action: ToolGuardrailAction = "allow"
+    action: ToolGuardrailAction = ToolGuardrailAction.ALLOW
     code: str = "allow"
     message: str = ""
     tool_name: str = ""
@@ -59,11 +65,11 @@ class ToolGuardrailDecision:
 
     @property
     def allows_execution(self) -> bool:
-        return self.action in {"allow", "warn"}
+        return self.action in {ToolGuardrailAction.ALLOW, ToolGuardrailAction.WARN}
 
     @property
     def should_halt(self) -> bool:
-        return self.action == "halt"
+        return self.action == ToolGuardrailAction.HALT
 
 
 class ToolCallGuardrailController:
@@ -104,7 +110,7 @@ class ToolCallGuardrailController:
         elif tool_name == "portfolio_write_remove_holding":
             if signature in self._single_remove_calls:
                 return ToolGuardrailDecision(
-                    action="block",
+                    action=ToolGuardrailAction.BLOCK,
                     code="remove_holding_use_batch",
                     message="Use portfolio_write_remove_candidates for repeated holding removals.",
                     tool_name=tool_name,
@@ -117,7 +123,7 @@ class ToolCallGuardrailController:
             command = str((args or {}).get("command") or "").lower()
             if "dojo_tools" in command or "load_tool_result" in command:
                 decision = ToolGuardrailDecision(
-                    action="block",
+                    action=ToolGuardrailAction.BLOCK,
                     code="terminal_dojo_tools_blocked",
                     message=(
                         "Blocked terminal: dojo_tools.load_tool_result only works inside execute_code. "
@@ -132,7 +138,7 @@ class ToolCallGuardrailController:
         exact_count = self._exact_failure_counts.get(signature, 0)
         if exact_count >= self.exact_failure_block_after:
             decision = ToolGuardrailDecision(
-                action="block",
+                action=ToolGuardrailAction.BLOCK,
                 code="repeated_exact_failure_block",
                 message=(
                     f"Blocked {tool_name}: the same tool call failed {exact_count} "
@@ -152,7 +158,7 @@ class ToolCallGuardrailController:
                 _result_hash, repeat_count = record
                 if repeat_count >= self.no_progress_block_after:
                     decision = ToolGuardrailDecision(
-                        action="block",
+                        action=ToolGuardrailAction.BLOCK,
                         code="idempotent_no_progress_block",
                         message=(
                             f"Blocked {tool_name}: this read-only call returned the same "
@@ -187,7 +193,7 @@ class ToolCallGuardrailController:
 
             if same_count >= self.same_tool_failure_halt_after:
                 decision = ToolGuardrailDecision(
-                    action="halt",
+                    action=ToolGuardrailAction.HALT,
                     code="same_tool_failure_halt",
                     message=(f"Stopped {tool_name}: it failed {same_count} times this turn. " "Stop retrying the same failing tool path and choose a different approach."),
                     tool_name=tool_name,
@@ -199,7 +205,7 @@ class ToolCallGuardrailController:
 
             if exact_count >= self.exact_failure_warn_after:
                 return ToolGuardrailDecision(
-                    action="warn",
+                    action=ToolGuardrailAction.WARN,
                     code="repeated_exact_failure_warning",
                     message=(
                         f"{tool_name} has failed {exact_count} times with identical arguments. "
@@ -213,7 +219,7 @@ class ToolCallGuardrailController:
 
             if same_count >= self.same_tool_failure_warn_after:
                 return ToolGuardrailDecision(
-                    action="warn",
+                    action=ToolGuardrailAction.WARN,
                     code="same_tool_failure_warning",
                     message=(
                         f"{tool_name} has failed {same_count} times this turn. "
@@ -244,7 +250,7 @@ class ToolCallGuardrailController:
 
         if repeat_count >= self.no_progress_warn_after:
             return ToolGuardrailDecision(
-                action="warn",
+                action=ToolGuardrailAction.WARN,
                 code="idempotent_no_progress_warning",
                 message=(
                     f"{tool_name} returned the same result {repeat_count} times. " "Use the result already provided or change the query instead of " "repeating it unchanged."
@@ -277,8 +283,8 @@ def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> dict[str, Any
 
 
 def append_toolguard_guidance(result_content: str, decision: ToolGuardrailDecision) -> str:
-    if decision.action not in {"warn", "halt"} or not decision.message:
+    if decision.action not in {ToolGuardrailAction.WARN, ToolGuardrailAction.HALT} or not decision.message:
         return result_content
-    label = "Tool loop hard stop" if decision.action == "halt" else "Tool loop warning"
+    label = "Tool loop hard stop" if decision.action == ToolGuardrailAction.HALT else "Tool loop warning"
     suffix = f"\n\n[{label}: " f"{decision.code}; count={decision.count}; {decision.message}]"
     return (result_content or "") + suffix
