@@ -1865,6 +1865,8 @@ class AgentLoop:
 
             if self.config.enable_guardrails:
                 decision = self.guardrails.after_call(tool_name, args, raw_result, failed=is_failed)
+                if decision.should_halt:
+                    raise GuardrailHaltException(decision.message, "guardrail_halt")
                 if decision.action == "warn":
                     from dojoagents.agent.guardrails import append_toolguard_guidance
 

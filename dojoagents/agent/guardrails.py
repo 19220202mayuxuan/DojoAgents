@@ -3,7 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
+
+
+ToolGuardrailAction = Literal["allow", "warn", "block", "halt"]
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
     {
@@ -47,7 +50,7 @@ class ToolCallSignature:
 
 @dataclass(frozen=True)
 class ToolGuardrailDecision:
-    action: str = "allow"  # allow | warn | block | halt
+    action: ToolGuardrailAction = "allow"
     code: str = "allow"
     message: str = ""
     tool_name: str = ""
@@ -60,7 +63,7 @@ class ToolGuardrailDecision:
 
     @property
     def should_halt(self) -> bool:
-        return self.action in {"block", "halt"}
+        return self.action == "halt"
 
 
 class ToolCallGuardrailController:
