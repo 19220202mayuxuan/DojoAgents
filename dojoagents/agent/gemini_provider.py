@@ -376,7 +376,7 @@ async def _iter_sse_payloads(response: Any) -> Any:
                 yield parsed
 
 
-def _emit_stream_deltas(
+async def _emit_stream_deltas(
     payload: dict[str, Any],
     *,
     stream_callback: Callable[[str], None] | None,
@@ -398,6 +398,8 @@ def _emit_stream_deltas(
             continue
         delta = text[previous_length:]
         seen_lengths[idx] = len(text)
+        if event_sink is not None:
+            await event_sink.wait_for_capacity()
         if is_reasoning:
             if event_sink is None:
                 continue
@@ -589,7 +591,7 @@ class GeminiNativeProvider:
                             chunk_function_calls = sum(1 for part in _iter_candidate_parts(payload) if isinstance(part.get("functionCall"), dict))
                             if chunk_function_calls:
                                 function_call_chunks += 1
-                            reasoning_started = _emit_stream_deltas(
+                            reasoning_started = await _emit_stream_deltas(
                                 payload,
                                 stream_callback=stream_callback,
                                 event_sink=event_sink,
@@ -624,6 +626,7 @@ class GeminiNativeProvider:
                     )
                     if reasoning_started:
                         if event_sink is not None:
+                            await event_sink.wait_for_capacity()
                             event_sink.thinking_end()
                         result.metadata["reasoning_streamed"] = True
                     LOGGER.info(

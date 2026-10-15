@@ -68,13 +68,24 @@ class _DurableEventWriter:
     ) -> None:
         self.coordinator = coordinator
         self.sink = sink
-        self._send_stream, self._receive_stream = anyio.create_memory_object_stream[AgentEvent](
-            max_buffer_size=32
-        )
+        self._send_stream, self._receive_stream = anyio.create_memory_object_stream[AgentEvent](max_buffer_size=32)
         self._closed = False
+        self._space_available = anyio.Event()
+        self._error: BaseException | None = None
         self.sink.add_listener(self._enqueue)
+        self.sink.add_capacity_waiter(self._wait_for_capacity)
         self._done = anyio.Event()
         task_group.start_soon(self._run, name=f"dojo-events:{coordinator.run_id}")
+
+    async def _wait_for_capacity(self) -> None:
+        while not self._closed:
+            if self._error is not None:
+                raise self._error
+            available = self._space_available
+            # Reserve space for phase/start/end events around each streaming delta.
+            if self._send_stream.statistics().current_buffer_used < 28:
+                return
+            await available.wait()
 
     def _enqueue(self, event: AgentEvent) -> None:
         if not self._closed:
@@ -141,13 +152,20 @@ class _DurableEventWriter:
                             stream_closed = True
                             break
                         pending.append(queued)
+                    self._space_available.set()
+                    self._space_available = anyio.Event()
                     try:
                         await self._persist(pending)
-                    except SessionLeaseLostError:
+                    except SessionLeaseLostError as exc:
+                        self._error = exc
                         return
                     if stream_closed:
                         return
+        except BaseException as exc:
+            self._error = exc
+            raise
         finally:
+            self._space_available.set()
             self._done.set()
 
     async def close(self) -> None:
@@ -156,6 +174,8 @@ class _DurableEventWriter:
             return
         self._closed = True
         self.sink.remove_listener(self._enqueue)
+        self.sink.remove_capacity_waiter(self._wait_for_capacity)
+        self._space_available.set()
         await self._send_stream.aclose()
         await self._done.wait()
 
