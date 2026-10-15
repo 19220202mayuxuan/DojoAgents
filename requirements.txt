@@ -15,7 +15,7 @@ mcp>=1.26.0,<2
 pyinstrument
 strands-agents
 strands-agents-tools
-dojosdk>=0.1.29
+dojosdk>=0.1.30
 exchange-calendars>=4,<5
 portalocker
 ddgs
