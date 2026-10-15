@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 
 def _utc_timestamp() -> str:
@@ -158,6 +158,7 @@ class AgentEventSink:
         self.session_id = session_id
         self._emit = emit
         self._listeners: list[Callable[[AgentEvent], None]] = []
+        self._capacity_waiters: list[Callable[[], Awaitable[None]]] = []
         self._seq = max(0, int(start_seq))
         self.events: list[dict[str, Any]] = []
 
@@ -174,6 +175,19 @@ class AgentEventSink:
             self._listeners.remove(listener)
         except ValueError:
             pass
+
+    def add_capacity_waiter(self, waiter: Callable[[], Awaitable[None]]) -> None:
+        if waiter not in self._capacity_waiters:
+            self._capacity_waiters.append(waiter)
+
+    def remove_capacity_waiter(self, waiter: Callable[[], Awaitable[None]]) -> None:
+        if waiter in self._capacity_waiters:
+            self._capacity_waiters.remove(waiter)
+
+    async def wait_for_capacity(self) -> None:
+        """Apply persistence backpressure before emitting a streaming chunk."""
+        for waiter in tuple(self._capacity_waiters):
+            await waiter()
 
     def _dispatch(self, event_cls: type[AgentEvent], **payload: Any) -> dict[str, Any]:
         self._seq += 1

@@ -1,6 +1,7 @@
 from typing import Any, Callable, Protocol
 
 from dojoagents.agent.context_length import ContextLengthExceededError, parse_context_length_error
+from dojoagents.agent.models import LLMResult
 from dojoagents.agent.provider_contracts import (
     OPENAI_COMPATIBLE_DEFAULT,
     OpenAIRequestPolicy,
@@ -15,7 +16,6 @@ from dojoagents.agent.provider_response import (
 )
 from dojoagents.agent.provider_transport import OpenAITransport
 from dojoagents.logging import LOGGER
-from dojoagents.agent.models import LLMResult
 
 
 class LLMProvider(Protocol):

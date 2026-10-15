@@ -294,6 +294,8 @@ class OpenAIResponseAdapter:
             choice = chunk.choices[0]
             finish_reason = _finish_reason(choice) or finish_reason
             delta = choice.delta
+            if event_sink is not None:
+                await event_sink.wait_for_capacity()
             reasoning_delta = getattr(delta, "reasoning_content", None) or (
                 delta.model_extra.get("reasoning_content")
                 if hasattr(delta, "model_extra") and delta.model_extra

@@ -15,6 +15,7 @@ from dojoagents.dashboard.jobs.precompute.theme_state_daily import (
     build_theme_state_precomputed,
 )
 from dojoagents.dashboard.services.stock_quote_filter import apply_configured_ticker_market_cap_mins
+from dojoagents.dashboard.cli.precompute_sector import log_precompute_startup, log_precompute_sdk_runtime
 from dojoagents.logging import LOGGER
 
 _PHASE_LABELS: dict[str, str] = {
@@ -34,6 +35,7 @@ def configure_parser(subcommands: argparse._SubParsersAction) -> None:
     )
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--config", default="~/.dojo/agents.yaml")
+    parser.add_argument("--debug", action="store_true", help="Log redacted startup configuration and precompute diagnostics")
     parser.add_argument("--input-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--start-date", default=None)
@@ -91,23 +93,24 @@ async def run_precompute_sector_theme_state(args: argparse.Namespace) -> int:
     progress = _PrecomputeProgressReporter()
     on_progress: ProgressCallback = progress.callback
 
-    agents_config = ConfigStore(getattr(args, "config", None) or "~/.dojo/agents.yaml").snapshot()
-    client = create_async_dojo(agents_config)
-    write_client = create_async_dojo(agents_config, online=True) if args.upload else None
-    registry = FinancialDomainRegistry()
-    # Phase B reads Phase A from disk. Do not preload the precomputed stores here:
-    # their normal load path may sync the remote dataset over the local input.
-    await registry.init_and_load_all(client, data_root=data_root, preload=False)
-    base_stores = ["sector_store", "benchmark_store"]
-    if not args.skip_fundamentals:
-        base_stores.append("stock_fin_indicators_store")
-    if not args.skip_volume_enrich:
-        base_stores.extend(["stock_store", "stock_sector_store"])
-    await registry.preload(base_stores)
-    if not args.skip_volume_enrich:
-        await registry.preload(["kline_store"])
-
+    config_store = ConfigStore(getattr(args, "config", None) or "~/.dojo/agents.yaml")
+    agents_config = config_store.snapshot()
+    log_precompute_startup(args, config_store)
+    client = create_async_dojo(agents_config, online=True)
+    write_client = None
     try:
+        write_client = create_async_dojo(agents_config, online=True) if args.upload else None
+        log_precompute_sdk_runtime(client, role="reader")
+        if write_client is not None:
+            log_precompute_sdk_runtime(write_client, role="writer")
+        registry = FinancialDomainRegistry()
+        # Phase B reads Phase A from disk; preloading old snapshots can replace it.
+        await registry.init_and_load_all(client, data_root=data_root, preload=False)
+        base_stores = ["sector_store", "benchmark_store"]
+        if not args.skip_volume_enrich:
+            base_stores.extend(["stock_store", "stock_sector_store", "kline_store"])
+        await registry.ensure_stores_loaded(*base_stores)
+
         manifest = await build_theme_state_precomputed(
             data_root=data_root,
             source_dir=input_dir,
@@ -123,16 +126,15 @@ async def run_precompute_sector_theme_state(args: argparse.Namespace) -> int:
             skip_volume_enrich=bool(args.skip_volume_enrich),
             on_progress=on_progress,
         )
+        published_dir = Path(manifest["published_dir"])
+        if registry.sector_precomputed_store is not None:
+            registry.sector_precomputed_store.reload(published_dir)
+        if registry.theme_state_precomputed_store is not None:
+            registry.theme_state_precomputed_store.reload(published_dir)
+        LOGGER.info("%s", json.dumps(manifest, ensure_ascii=False, indent=2))
+        return 0
     finally:
         progress.close()
-
-    published_dir = Path(manifest["published_dir"])
-    if registry.sector_precomputed_store is not None:
-        registry.sector_precomputed_store.reload(published_dir)
-    if registry.theme_state_precomputed_store is not None:
-        registry.theme_state_precomputed_store.reload(published_dir)
-    LOGGER.info("%s", json.dumps(manifest, ensure_ascii=False, indent=2))
-    await close_async_dojo(client)
-    if write_client is not None:
-        await close_async_dojo(write_client)
-    return 0
+        await close_async_dojo(client)
+        if write_client is not None:
+            await close_async_dojo(write_client)

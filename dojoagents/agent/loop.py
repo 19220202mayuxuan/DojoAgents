@@ -323,9 +323,7 @@ class DojoStrandsModelBridge(Model):
                     }
                 )
 
-        send_stream, receive_stream = anyio.create_memory_object_stream[Any](
-            max_buffer_size=64
-        )
+        send_stream, receive_stream = anyio.create_memory_object_stream[Any](max_buffer_size=64)
 
         def callback(delta: str) -> None:
             try:
@@ -425,6 +423,9 @@ class DojoStrandsModelBridge(Model):
                     if isinstance(item, Exception):
                         raise item
                     elif isinstance(item, str):
+                        sink = (invocation_state or {}).get("_dojo_event_sink")
+                        if sink is not None:
+                            await sink.wait_for_capacity()
                         has_text_delta = True
                         yield {
                             "contentBlockDelta": {
@@ -524,6 +525,7 @@ class DojoStrandsModelBridge(Model):
             event_sink = (invocation_state or {}).get("_dojo_event_sink")
             reasoning_streamed = bool((llm_result.metadata or {}).get("reasoning_streamed"))
             if event_sink is not None and not reasoning_streamed and isinstance(reasoning_content, str) and reasoning_content.strip():
+                await event_sink.wait_for_capacity()
                 event_sink.thinking_start()
                 event_sink.thinking_delta(reasoning_content)
                 event_sink.thinking_end()
@@ -824,6 +826,7 @@ class AgentLoop:
                         LOGGER.exception("Chat cache run alias failed; canonical replay will continue")
                     try:
                         for payload in replayed:
+                            await active_sink.wait_for_capacity()
                             active_sink.replay(payload)
                         await canonical_run.commit(response)
                         return response

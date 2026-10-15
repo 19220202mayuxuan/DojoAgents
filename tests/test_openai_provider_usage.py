@@ -372,6 +372,7 @@ async def test_openai_provider_streams_reasoning_before_content():
     provider = OpenAICompatibleProvider(api_key="test-key", base_url="http://example")
     order: list[tuple[str, str]] = []
     event_sink = MagicMock()
+    event_sink.wait_for_capacity = AsyncMock()
     event_sink.thinking_start.side_effect = lambda: order.append(("think_start", ""))
     event_sink.thinking_delta.side_effect = lambda text: order.append(("think_delta", text))
     event_sink.thinking_end.side_effect = lambda: order.append(("think_end", ""))
